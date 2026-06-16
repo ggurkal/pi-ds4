@@ -23,7 +23,7 @@ Minimal example:
 Common settings:
 
 - `protocol`: `openai` (default), `openai-responses`, or `anthropic`
-- `modelQuant`: force `q2`, `q2-imatrix`, or `q4` for `ds4/deepseek-v4-flash`
+- `modelQuant`: force `q2`/`q2-imatrix` or `q4`/`q4-imatrix` for `ds4/deepseek-v4-flash`
 - `readyTimeoutMs`: server startup timeout in ms
 - `runtimeDir`: existing antirez/ds4 checkout instead of `~/.pi/ds4/support`
 - `supportRepo` / `supportBranch`: runtime checkout source

@@ -247,15 +247,20 @@ function truncateText(value: string, width: number, ellipsis = "", pad = false):
 
 function selectedDefaultModelQuant(): ModelQuant {
 	const forced = configString("DS4_MODEL_QUANT")?.toLowerCase();
-	if (forced === "q2" || forced === "q2-imatrix" || forced === "q4") return forced;
-	if (forced) throw new Error(`Invalid DS4_MODEL_QUANT=${forced}; expected q2, q2-imatrix or q4`);
+	if (forced === "q2" || forced === "q2-imatrix") return "q2-imatrix";
+	if (forced === "q4" || forced === "q4-imatrix") return "q4";
+	if (forced) throw new Error(`Invalid DS4_MODEL_QUANT=${forced}; expected q2, q2-imatrix, q4 or q4-imatrix`);
 
 	const ramGb = totalmem() / 1_000_000_000;
 	if (ramGb >= 256) return "q4";
-	if (ramGb >= 128) return "q2";
+	if (ramGb >= 128) return "q2-imatrix";
 	throw new Error(
-		`DeepSeek V4 Flash requires at least 128 GB RAM for the q2 model; detected ${ramGb.toFixed(1)} GB`,
+		`DeepSeek V4 Flash requires at least 128 GB RAM for the q2-imatrix model; detected ${ramGb.toFixed(1)} GB`,
 	);
+}
+
+function canonicalModelQuant(modelQuant: ModelQuant): ModelQuant {
+	return modelQuant === "q2" ? "q2-imatrix" : modelQuant;
 }
 
 function modelQuantForModelId(modelId: string | undefined): ModelQuant | undefined {
@@ -265,11 +270,38 @@ function modelQuantForModelId(modelId: string | undefined): ModelQuant | undefin
 }
 
 function modelIdForQuant(modelQuant: ModelQuant): string {
+	modelQuant = canonicalModelQuant(modelQuant);
 	return modelQuant === "q2-imatrix" ? Q2_IMATRIX_MODEL_ID : MODEL_ID;
 }
 
 function kvDirForQuant(modelQuant: ModelQuant): string {
+	modelQuant = canonicalModelQuant(modelQuant);
 	return modelQuant === "q2-imatrix" ? join(DS4_DIR, "kv-q2-imatrix") : KV_DIR;
+}
+
+function downloadTargetsForQuant(modelQuant: ModelQuant): string[] {
+	modelQuant = canonicalModelQuant(modelQuant);
+	return modelQuant === "q4" ? ["q4-imatrix", "q4"] : ["q2-imatrix", "q2"];
+}
+
+function downloadScriptMentionsTarget(script: string, target: string): boolean {
+	return (
+		script.includes(`${target})`) ||
+		script.includes(`${target}|`) ||
+		script.includes(`|${target}`) ||
+		script.includes(`./download_model.sh ${target}`)
+	);
+}
+
+async function selectDownloadTarget(runtimeDir: string, modelQuant: ModelQuant): Promise<string> {
+	const targets = downloadTargetsForQuant(modelQuant);
+	const script = await readFile(join(runtimeDir, "download_model.sh"), "utf8").catch(() => undefined);
+	if (script) {
+		for (const target of targets) {
+			if (downloadScriptMentionsTarget(script, target)) return target;
+		}
+	}
+	return targets[0];
 }
 
 function serverArgsForModel(modelQuant: ModelQuant, modelPath: string): string[] {
@@ -278,7 +310,8 @@ function serverArgsForModel(modelQuant: ModelQuant, modelPath: string): string[]
 
 function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: ModelQuant): boolean {
 	if (!state) return false;
-	if (state.modelQuant) return state.modelQuant === modelQuant;
+	modelQuant = canonicalModelQuant(modelQuant);
+	if (state.modelQuant) return canonicalModelQuant(state.modelQuant) === modelQuant;
 	// Older pi-ds4 installs did not record the quant. Treat them as matching the
 	// historical default model, but never as the explicit q2-imatrix choice.
 	return modelQuant !== "q2-imatrix";
@@ -543,11 +576,23 @@ async function looksLikeDs4Server(pid: number): Promise<boolean> {
 	return !!args && /(^|[/\s])ds4-server(\s|$)/.test(args);
 }
 
-async function findListeningDs4ServerPid(): Promise<number | undefined> {
+async function findListeningPids(): Promise<number[]> {
 	const output = await execCapture("lsof", ["-nP", "-tiTCP:8000", "-sTCP:LISTEN"], 2_000);
+	const pids: number[] = [];
 	for (const line of (output ?? "").split(/\r?\n/)) {
 		const pid = Number(line.trim());
-		if (Number.isInteger(pid) && isPidAlive(pid) && (await looksLikeDs4Server(pid))) return pid;
+		if (Number.isInteger(pid) && isPidAlive(pid) && !pids.includes(pid)) pids.push(pid);
+	}
+	return pids;
+}
+
+async function findListeningPid(): Promise<number | undefined> {
+	return (await findListeningPids())[0];
+}
+
+async function findListeningDs4ServerPid(): Promise<number | undefined> {
+	for (const pid of await findListeningPids()) {
+		if (await looksLikeDs4Server(pid)) return pid;
 	}
 	return undefined;
 }
@@ -891,10 +936,11 @@ async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promi
 }
 
 async function ensureModel(runtimeDir: string, modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<string> {
-	onStatus?.(`ensuring ${modelQuant} model`);
-	await runLogged("./download_model.sh", [modelQuant], runtimeDir, `download ${modelQuant} model`, {
+	const downloadTarget = await selectDownloadTarget(runtimeDir, modelQuant);
+	onStatus?.(`ensuring ${downloadTarget} model`);
+	await runLogged("./download_model.sh", [downloadTarget], runtimeDir, `download ${downloadTarget} model`, {
 		onStatus,
-		progressPrefix: `ensuring ${modelQuant} model`,
+		progressPrefix: `ensuring ${downloadTarget} model`,
 	});
 
 	const modelPath = join(runtimeDir, "ds4flash.gguf");
@@ -1132,6 +1178,14 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 		await access(binary, constants.X_OK);
 	} catch {
 		throw new Error(`Cannot execute ds4-server at ${binary}`);
+	}
+
+	const listeningPid = await findListeningPid();
+	if (listeningPid) {
+		const args = await processArgs(listeningPid);
+		throw new Error(
+			`Cannot start ds4-server: ${BASE_URL} is already in use by pid ${listeningPid}${args ? ` (${args})` : ""}`,
+		);
 	}
 
 	const kvDir = kvDirForQuant(modelQuant);

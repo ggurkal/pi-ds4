@@ -12,9 +12,9 @@ and stops the server via a bundled watchdog when no clients are left.
 ## Requirements and Behavior
 
 You will need a mac with at least 128GB of RAM.  The default
-`ds4/deepseek-v4-flash` model installs the 2-bit quantized model if you have
-128GB of RAM and picks the 4-bit quantized model if you have 256GB or more.
-Select `ds4/deepseek-v4-flash-q2-imatrix` to use the imatrix-tuned q2 model.
+`ds4/deepseek-v4-flash` model installs the q2-imatrix model if you have 128GB
+of RAM and picks the q4-imatrix model if you have 256GB or more. Select
+`ds4/deepseek-v4-flash-q2-imatrix` to force the q2-imatrix model.
 
 If you are signed into huggingface then your token is used for faster downloads.
 The server is compiled/started and models are downloaded automatically on first
@@ -45,7 +45,7 @@ Then restart pi or run `/reload`.
 Runtime state is kept under `~/.pi/ds4`:
 
 - `support/` — shallow checkout of `https://github.com/antirez/ds4` (`main` by default)
-- `kv/` — on-disk KV cache for the default model choice
+- `kv/` — on-disk KV cache for the q4 model choice
 - `kv-q2-imatrix/` — on-disk KV cache for the q2-imatrix model choice
 - `clients/` — active pi process leases
 - `settings.json` — optional extension configuration overrides
@@ -67,8 +67,8 @@ variables win over the settings file.
 - `DS4_SUPPORT_REPO`: runtime repo URL (default `https://github.com/antirez/ds4`)
 - `DS4_SUPPORT_BRANCH`: runtime branch (default `main`)
 - `DS4_RUNTIME_DIR`: use an existing ds4 checkout instead of `~/.pi/ds4/support`
-- `DS4_MODEL_QUANT`: force `q2`, `q2-imatrix`, or `q4` for the default model
-  choice (otherwise picked from system memory)
+- `DS4_MODEL_QUANT`: force `q2`/`q2-imatrix` or `q4`/`q4-imatrix` for the
+  default model choice (otherwise picked from system memory)
 - `DS4_READY_TIMEOUT_MS`: server startup timeout
 - `DS4_SERVER_BINARY`: custom `ds4-server` binary path
 - `DS4_WATCHDOG_SCRIPT`: custom watchdog script path
