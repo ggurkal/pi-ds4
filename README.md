@@ -6,8 +6,9 @@ and behavior can be around local models.
 
 The extension registers `ds4/deepseek-v4-flash` and
 `ds4/deepseek-v4-flash-q2-imatrix` as models for `/model`, starts `ds4-server`
-on demand, downloads/builds the runtime if needed, keeps a per-pi-process lease,
-and stops the server via a bundled watchdog when no clients are left.
+on demand on a remembered random localhost port, downloads/builds the runtime if
+needed, keeps a per-pi-process lease, and stops the server via a bundled watchdog
+when no clients are left.
 
 ## Requirements and Behavior
 
@@ -48,6 +49,8 @@ Runtime state is kept under `~/.pi/ds4`:
 - `kv/` — on-disk KV cache for the q4 model choice
 - `kv-q2-imatrix/` — on-disk KV cache for the q2-imatrix model choice
 - `clients/` — active pi process leases
+- `port.json` — reserved random local port, guarded by the owning pi/server PID
+- `server.json` — live `ds4-server` PID, endpoint, and model state
 - `settings.json` — optional extension configuration overrides
 - `log` — build/download/server/watchdog log
 

@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
+import { createServer } from "node:net";
 import {
 	access,
 	appendFile,
@@ -34,7 +35,9 @@ const KV_DIR = join(DS4_DIR, "kv");
 const SUPPORT_DIR = join(DS4_DIR, "support");
 const CLIENT_DIR = join(DS4_DIR, "clients");
 const LOCK_DIR = join(DS4_DIR, "lock");
+const PORT_LOCK_DIR = join(DS4_DIR, "port.lock");
 const STATE_FILE = join(DS4_DIR, "server.json");
+const PORT_FILE = join(DS4_DIR, "port.json");
 const LOG_FILE = join(DS4_DIR, "log");
 const LEASE_FILE = join(CLIENT_DIR, `${process.pid}.json`);
 
@@ -108,10 +111,8 @@ function selectedProtocol(): ProviderProtocol {
 const SUPPORT_REPO = configString("DS4_SUPPORT_REPO", "https://github.com/antirez/ds4")!;
 const SUPPORT_BRANCH = configString("DS4_SUPPORT_BRANCH", "main")!;
 
-const BASE_URL = "http://127.0.0.1:8000";
-const API_BASE_URL = `${BASE_URL}/v1`;
+const SERVER_HOST = "127.0.0.1";
 const PROVIDER_API = selectedProtocol();
-const PROVIDER_BASE_URL = PROVIDER_API === "anthropic-messages" ? BASE_URL : API_BASE_URL;
 const SERVER_BASE_ARGS = ["--ctx", "100000", "--kv-disk-space-mb", "8192"];
 
 const HEARTBEAT_MS = 10_000;
@@ -131,6 +132,13 @@ const PROGRESS_MAX_CHARS = 160;
 
 type ModelQuant = "q2" | "q2-imatrix" | "q4";
 
+type ServerEndpoint = {
+	host: string;
+	port: number;
+	origin: string;
+	apiBaseUrl: string;
+};
+
 type ServerState = {
 	managedBy: string;
 	pid: number;
@@ -140,6 +148,11 @@ type ServerState = {
 	args: string[];
 	startedAt: number;
 	startedAtIso: string;
+	processStart?: string;
+	host?: string;
+	origin?: string;
+	apiBaseUrl?: string;
+	port?: number;
 	modelId?: string;
 	modelQuant?: ModelQuant;
 	modelPath?: string;
@@ -147,6 +160,21 @@ type ServerState = {
 	stopping?: boolean;
 	stoppingAt?: number;
 	stoppingAtIso?: string;
+};
+
+type PortState = {
+	managedBy: string;
+	host: string;
+	port: number;
+	origin: string;
+	apiBaseUrl: string;
+	reservedByPid?: number;
+	reservedByProcessStart?: string;
+	serverPid?: number;
+	serverProcessStart?: string;
+	cwd?: string;
+	updatedAt: number;
+	updatedAtIso: string;
 };
 
 type Lease = {
@@ -178,6 +206,7 @@ let startupPromise: Promise<void> | undefined;
 let startupModelQuant: ModelQuant | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
+let currentEndpoint: ServerEndpoint | undefined;
 let leaseStartedAt = Date.now();
 let ownProcessStart: string | undefined;
 let leaseActive = false;
@@ -204,6 +233,61 @@ function isPidAlive(pid: unknown): pid is number {
 	} catch (error: any) {
 		return error?.code === "EPERM";
 	}
+}
+
+function isValidPort(port: unknown): port is number {
+	return typeof port === "number" && Number.isInteger(port) && port > 0 && port < 65536;
+}
+
+function hostForUrl(host: string): string {
+	return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function endpointForPort(port: number, host = SERVER_HOST): ServerEndpoint {
+	if (!isValidPort(port)) throw new Error(`Invalid ds4-server port: ${port}`);
+	const origin = `http://${hostForUrl(host)}:${port}`;
+	return { host, port, origin, apiBaseUrl: `${origin}/v1` };
+}
+
+function endpointFromUrl(value: string | undefined): ServerEndpoint | undefined {
+	if (!value) return undefined;
+	try {
+		const url = new URL(value);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+		const port = Number(url.port || (url.protocol === "http:" ? 80 : 443));
+		if (!isValidPort(port)) return undefined;
+		return endpointForPort(port, url.hostname || SERVER_HOST);
+	} catch {
+		return undefined;
+	}
+}
+
+function endpointFromState(state: ServerState | undefined): ServerEndpoint | undefined {
+	if (!state) return undefined;
+	if (isValidPort(state.port)) return endpointForPort(state.port, state.host || SERVER_HOST);
+	return endpointFromUrl(state.origin) ?? endpointFromUrl(state.apiBaseUrl) ?? endpointFromUrl(state.baseUrl);
+}
+
+function endpointFromPortState(state: PortState | undefined): ServerEndpoint | undefined {
+	if (!state || state.managedBy !== MANAGED_BY || !isValidPort(state.port)) return undefined;
+	return endpointForPort(state.port, state.host || SERVER_HOST);
+}
+
+function currentServerEndpoint(): ServerEndpoint {
+	if (!currentEndpoint) throw new Error("ds4-server endpoint was not initialized");
+	return currentEndpoint;
+}
+
+function baseUrl(): string {
+	return currentServerEndpoint().origin;
+}
+
+function apiBaseUrl(): string {
+	return currentServerEndpoint().apiBaseUrl;
+}
+
+function providerBaseUrl(): string {
+	return PROVIDER_API === "anthropic-messages" ? baseUrl() : apiBaseUrl();
 }
 
 function shellQuote(value: string): string {
@@ -304,8 +388,18 @@ async function selectDownloadTarget(runtimeDir: string, modelQuant: ModelQuant):
 	return targets[0];
 }
 
-function serverArgsForModel(modelQuant: ModelQuant, modelPath: string): string[] {
-	return ["--model", modelPath, ...SERVER_BASE_ARGS, "--kv-disk-dir", kvDirForQuant(modelQuant)];
+function serverArgsForModel(modelQuant: ModelQuant, modelPath: string, endpoint = currentServerEndpoint()): string[] {
+	return [
+		"--model",
+		modelPath,
+		"--host",
+		endpoint.host,
+		"--port",
+		String(endpoint.port),
+		...SERVER_BASE_ARGS,
+		"--kv-disk-dir",
+		kvDirForQuant(modelQuant),
+	];
 }
 
 function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: ModelQuant): boolean {
@@ -576,8 +670,126 @@ async function looksLikeDs4Server(pid: number): Promise<boolean> {
 	return !!args && /(^|[/\s])ds4-server(\s|$)/.test(args);
 }
 
-async function findListeningPids(): Promise<number[]> {
-	const output = await execCapture("lsof", ["-nP", "-tiTCP:8000", "-sTCP:LISTEN"], 2_000);
+async function processStartMatches(pid: number, expected: string | undefined): Promise<boolean> {
+	if (!expected || expected === "unknown") return true;
+	const currentStart = await processStart(pid);
+	return !!currentStart && currentStart === expected;
+}
+
+async function isServerStateForLiveDs4(state: ServerState | undefined): Promise<boolean> {
+	if (!state || state.managedBy !== MANAGED_BY || !isPidAlive(state.pid)) return false;
+	if (!(await looksLikeDs4Server(state.pid))) return false;
+	return processStartMatches(state.pid, state.processStart);
+}
+
+async function isPortStateUsable(state: PortState | undefined): Promise<boolean> {
+	if (!endpointFromPortState(state)) return false;
+	if (state?.serverPid && isPidAlive(state.serverPid) && (await looksLikeDs4Server(state.serverPid))) {
+		return processStartMatches(state.serverPid, state.serverProcessStart);
+	}
+	if (state?.reservedByPid && isPidAlive(state.reservedByPid)) {
+		return processStartMatches(state.reservedByPid, state.reservedByProcessStart);
+	}
+	return false;
+}
+
+async function allocateRandomPort(host = SERVER_HOST): Promise<number> {
+	return new Promise((resolvePromise, reject) => {
+		const server = createServer();
+		let settled = false;
+		const finish = (error: Error | undefined, port?: number) => {
+			if (settled) return;
+			settled = true;
+			if (error) reject(error);
+			else if (isValidPort(port)) resolvePromise(port);
+			else reject(new Error("Could not allocate a random ds4-server port"));
+		};
+
+		server.unref();
+		server.on("error", (error) => finish(error));
+		server.listen(0, host, () => {
+			const address = server.address();
+			const port = typeof address === "object" && address ? address.port : undefined;
+			server.close((error) => finish(error ?? undefined, port));
+		});
+	});
+}
+
+async function writePortStateForReservation(endpoint: ServerEndpoint): Promise<void> {
+	const now = Date.now();
+	const state: PortState = {
+		managedBy: MANAGED_BY,
+		host: endpoint.host,
+		port: endpoint.port,
+		origin: endpoint.origin,
+		apiBaseUrl: endpoint.apiBaseUrl,
+		reservedByPid: process.pid,
+		reservedByProcessStart: await getOwnProcessStart(),
+		cwd: process.cwd(),
+		updatedAt: now,
+		updatedAtIso: new Date(now).toISOString(),
+	};
+	await writeJsonAtomic(PORT_FILE, state);
+}
+
+async function writePortStateForServer(endpoint: ServerEndpoint, pid: number, serverProcessStart?: string): Promise<void> {
+	const now = Date.now();
+	const state: PortState = {
+		managedBy: MANAGED_BY,
+		host: endpoint.host,
+		port: endpoint.port,
+		origin: endpoint.origin,
+		apiBaseUrl: endpoint.apiBaseUrl,
+		reservedByPid: process.pid,
+		reservedByProcessStart: await getOwnProcessStart(),
+		serverPid: pid,
+		serverProcessStart,
+		cwd: process.cwd(),
+		updatedAt: now,
+		updatedAtIso: new Date(now).toISOString(),
+	};
+	await writeJsonAtomic(PORT_FILE, state);
+}
+
+async function resolveEndpointLocked(): Promise<ServerEndpoint> {
+	if (currentEndpoint) return currentEndpoint;
+
+	const state = await readState();
+	const stateEndpoint = endpointFromState(state);
+	if (stateEndpoint && (await isServerStateForLiveDs4(state))) {
+		currentEndpoint = stateEndpoint;
+		await writePortStateForServer(stateEndpoint, state!.pid, state!.processStart).catch(() => {});
+		return currentEndpoint;
+	}
+	if (state?.pid) await clearState();
+
+	const portState = await readJson<PortState>(PORT_FILE);
+	const portStateEndpoint = endpointFromPortState(portState);
+	if (portStateEndpoint && (await isPortStateUsable(portState))) {
+		currentEndpoint = portStateEndpoint;
+		return currentEndpoint;
+	}
+	if (portState) await removeFile(PORT_FILE).catch(() => {});
+
+	currentEndpoint = endpointForPort(await allocateRandomPort());
+	await writePortStateForReservation(currentEndpoint);
+	await appendLog(`\n[${new Date().toISOString()}] reserved ds4-server endpoint ${currentEndpoint.origin} for pi pid=${process.pid}\n`);
+	return currentEndpoint;
+}
+
+async function initializeEndpoint(): Promise<void> {
+	await withPortLock(async () => {
+		await resolveEndpointLocked();
+	}, LOCK_TIMEOUT_MS);
+}
+
+function serverStateMatchesEndpoint(state: ServerState | undefined, endpoint = currentServerEndpoint()): boolean {
+	const stateEndpoint = endpointFromState(state);
+	return !!stateEndpoint && stateEndpoint.host === endpoint.host && stateEndpoint.port === endpoint.port;
+}
+
+async function findListeningPids(port = currentServerEndpoint().port): Promise<number[]> {
+	const output = await execCapture("lsof", ["-nP", `-tiTCP:${port}`, "-sTCP:LISTEN"], 2_000);
 	const pids: number[] = [];
 	for (const line of (output ?? "").split(/\r?\n/)) {
 		const pid = Number(line.trim());
@@ -655,6 +867,7 @@ async function ensureWatchdog(): Promise<void> {
 		return;
 	}
 
+	const endpoint = currentServerEndpoint();
 	const logFd = openSync(LOG_FILE, "a");
 	try {
 		const child = spawn("/bin/sh", [watchdogScript, DS4_DIR], {
@@ -666,7 +879,8 @@ async function ensureWatchdog(): Promise<void> {
 				DS4_CLIENT_DIR: CLIENT_DIR,
 				DS4_STATE_FILE: STATE_FILE,
 				DS4_LOG_FILE: LOG_FILE,
-				DS4_BASE_URL: API_BASE_URL,
+				DS4_BASE_URL: endpoint.apiBaseUrl,
+				DS4_PORT: String(endpoint.port),
 				DS4_LEASE_TTL_S: String(Math.ceil(LEASE_TTL_MS / 1000)),
 				DS4_WATCHDOG_POLL_S: String(Math.max(1, Math.ceil(WATCHDOG_POLL_MS / 1000))),
 				DS4_SHUTDOWN_GRACE_S: String(Math.ceil(SHUTDOWN_GRACE_MS / 1000)),
@@ -680,13 +894,20 @@ async function ensureWatchdog(): Promise<void> {
 }
 
 async function writeAdoptedServerStateLocked(pid: number): Promise<void> {
+	const endpoint = currentServerEndpoint();
 	const args = await processArgs(pid);
 	const now = Date.now();
 	const binary = args?.split(/\s+/, 1)[0] || "ds4-server";
+	const serverProcessStart = await processStart(pid);
 	const state: ServerState = {
 		managedBy: MANAGED_BY,
 		pid,
-		baseUrl: API_BASE_URL,
+		processStart: serverProcessStart,
+		host: endpoint.host,
+		port: endpoint.port,
+		origin: endpoint.origin,
+		apiBaseUrl: endpoint.apiBaseUrl,
+		baseUrl: endpoint.apiBaseUrl,
 		cwd: SUPPORT_DIR,
 		binary,
 		args: args ? [args] : [],
@@ -694,7 +915,8 @@ async function writeAdoptedServerStateLocked(pid: number): Promise<void> {
 		startedAtIso: new Date(now).toISOString(),
 	};
 	await writeJsonAtomic(STATE_FILE, state);
-	await appendLog(`\n[${new Date().toISOString()}] adopted existing ds4-server pid=${pid}\n`);
+	await writePortStateForServer(endpoint, pid, serverProcessStart).catch(() => {});
+	await appendLog(`\n[${new Date().toISOString()}] adopted existing ds4-server pid=${pid} at ${endpoint.origin}\n`);
 }
 
 function formatCurlProgress(line: string): string | undefined {
@@ -961,33 +1183,39 @@ async function ensureRuntimeReadyLocked(
 	return { runtimeDir, modelPath };
 }
 
-async function isLockStale(): Promise<boolean> {
-	const owner = await readJson<{ pid?: number; processStart?: string }>(join(LOCK_DIR, "owner.json"));
+async function isLockDirStale(lockDir: string): Promise<boolean> {
+	const owner = await readJson<{ pid?: number; processStart?: string }>(join(lockDir, "owner.json"));
 	if (owner?.pid) {
 		if (!isPidAlive(owner.pid)) return true;
-		if (owner.processStart) {
+		if (owner.processStart && owner.processStart !== "unknown") {
 			const currentStart = await processStart(owner.pid);
 			if (currentStart && currentStart !== owner.processStart) return true;
 		}
 	}
 
 	try {
-		const info = await stat(LOCK_DIR);
+		const info = await stat(lockDir);
 		return Date.now() - info.mtimeMs > LOCK_STALE_MS;
 	} catch {
 		return true;
 	}
 }
 
-async function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, abortOnDispose = false): Promise<T> {
+async function withDirLock<T>(
+	lockDir: string,
+	name: string,
+	fn: () => Promise<T>,
+	timeoutMs = LOCK_TIMEOUT_MS,
+	abortOnDispose = false,
+): Promise<T> {
 	await mkdir(DS4_DIR, { recursive: true });
 	const started = Date.now();
 
 	while (true) {
 		if (abortOnDispose && (runtimeDisposed || shuttingDown)) throw new Error("ds4 startup cancelled");
 		try {
-			await mkdir(LOCK_DIR);
-			await writeJsonAtomic(join(LOCK_DIR, "owner.json"), {
+			await mkdir(lockDir);
+			await writeJsonAtomic(join(lockDir, "owner.json"), {
 				managedBy: MANAGED_BY,
 				pid: process.pid,
 				processStart: await getOwnProcessStart(),
@@ -996,12 +1224,12 @@ async function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, ab
 			break;
 		} catch (error: any) {
 			if (error?.code !== "EEXIST") throw error;
-			if (await isLockStale()) {
-				await rm(LOCK_DIR, { recursive: true, force: true });
+			if (await isLockDirStale(lockDir)) {
+				await rm(lockDir, { recursive: true, force: true });
 				continue;
 			}
 			if (timeoutMs > 0 && Date.now() - started > timeoutMs) {
-				throw new Error(`Timed out waiting for ds4 lifecycle lock at ${LOCK_DIR}`);
+				throw new Error(`Timed out waiting for ds4 ${name} lock at ${lockDir}`);
 			}
 			await sleep(100 + Math.floor(Math.random() * 150));
 		}
@@ -1010,8 +1238,16 @@ async function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, ab
 	try {
 		return await fn();
 	} finally {
-		await rm(LOCK_DIR, { recursive: true, force: true });
+		await rm(lockDir, { recursive: true, force: true });
 	}
+}
+
+function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, abortOnDispose = false): Promise<T> {
+	return withDirLock(LOCK_DIR, "lifecycle", fn, timeoutMs, abortOnDispose);
+}
+
+function withPortLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS): Promise<T> {
+	return withDirLock(PORT_LOCK_DIR, "port", fn, timeoutMs, false);
 }
 
 async function touchLease(): Promise<void> {
@@ -1085,7 +1321,7 @@ async function checkHttpReady(): Promise<boolean> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), HTTP_CHECK_TIMEOUT_MS);
 	try {
-		const response = await fetch(`${API_BASE_URL}/models`, { signal: controller.signal });
+		const response = await fetch(`${apiBaseUrl()}/models`, { signal: controller.signal });
 		return response.ok;
 	} catch {
 		return false;
@@ -1105,17 +1341,19 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
 
 async function checkHttpReadyForQuant(modelQuant: ModelQuant): Promise<boolean> {
 	if (!(await checkHttpReady())) return false;
-	return serverStateMatchesQuant(await readState(), modelQuant);
+	const state = await readState();
+	return serverStateMatchesEndpoint(state) && serverStateMatchesQuant(state, modelQuant);
 }
 
 async function stopServerPidLocked(pid: number, reason: string): Promise<void> {
 	const previous = await readState();
+	const endpoint = endpointFromState(previous) ?? currentServerEndpoint();
 	const now = Date.now();
+	const serverProcessStart = previous?.processStart ?? (await processStart(pid));
 	await writeJsonAtomic(STATE_FILE, {
 		...(previous ?? {
 			managedBy: MANAGED_BY,
 			pid,
-			baseUrl: API_BASE_URL,
 			cwd: SUPPORT_DIR,
 			binary: "ds4-server",
 			args: [],
@@ -1123,6 +1361,12 @@ async function stopServerPidLocked(pid: number, reason: string): Promise<void> {
 			startedAtIso: new Date(now).toISOString(),
 		}),
 		pid,
+		processStart: serverProcessStart,
+		host: endpoint.host,
+		port: endpoint.port,
+		origin: endpoint.origin,
+		apiBaseUrl: endpoint.apiBaseUrl,
+		baseUrl: endpoint.apiBaseUrl,
 		stopping: true,
 		stoppingAt: now,
 		stoppingAtIso: new Date(now).toISOString(),
@@ -1157,7 +1401,7 @@ async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallb
 		if (await checkHttpReadyForQuant(modelQuant)) return;
 
 		const state = await readState();
-		if (state?.pid && !isPidAlive(state.pid)) {
+		if (state?.pid && !(await isServerStateForLiveDs4(state))) {
 			throw new Error(`ds4-server exited before becoming ready; see ${LOG_FILE}`);
 		}
 
@@ -1169,7 +1413,7 @@ async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallb
 		await sleep(1_000);
 	}
 
-	throw new Error(`Timed out waiting for ds4-server at ${API_BASE_URL}; see ${LOG_FILE}`);
+	throw new Error(`Timed out waiting for ds4-server at ${apiBaseUrl()}; see ${LOG_FILE}`);
 }
 
 async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, modelPath: string): Promise<void> {
@@ -1180,17 +1424,18 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 		throw new Error(`Cannot execute ds4-server at ${binary}`);
 	}
 
-	const listeningPid = await findListeningPid();
+	const endpoint = currentServerEndpoint();
+	const listeningPid = await findListeningPid(endpoint.port);
 	if (listeningPid) {
 		const args = await processArgs(listeningPid);
 		throw new Error(
-			`Cannot start ds4-server: ${BASE_URL} is already in use by pid ${listeningPid}${args ? ` (${args})` : ""}`,
+			`Cannot start ds4-server: ${endpoint.origin} is already in use by pid ${listeningPid}${args ? ` (${args})` : ""}`,
 		);
 	}
 
 	const kvDir = kvDirForQuant(modelQuant);
 	await mkdir(kvDir, { recursive: true });
-	const serverArgs = serverArgsForModel(modelQuant, modelPath);
+	const serverArgs = serverArgsForModel(modelQuant, modelPath, endpoint);
 
 	await appendLog(`\n[${new Date().toISOString()}] start ds4-server (${modelQuant})\n$ ${[binary, ...serverArgs].map(shellQuote).join(" ")}\n`);
 	const logFd = openSync(LOG_FILE, "a");
@@ -1211,10 +1456,16 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 	if (!childPid) throw new Error("Failed to start ds4-server: no child PID");
 
 	const now = Date.now();
+	const serverProcessStart = await processStart(childPid);
 	const state: ServerState = {
 		managedBy: MANAGED_BY,
 		pid: childPid,
-		baseUrl: API_BASE_URL,
+		processStart: serverProcessStart,
+		host: endpoint.host,
+		port: endpoint.port,
+		origin: endpoint.origin,
+		apiBaseUrl: endpoint.apiBaseUrl,
+		baseUrl: endpoint.apiBaseUrl,
 		cwd: runtimeDir,
 		binary,
 		args: serverArgs,
@@ -1226,6 +1477,7 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 		startedAtIso: new Date(now).toISOString(),
 	};
 	await writeJsonAtomic(STATE_FILE, state);
+	await writePortStateForServer(endpoint, childPid, serverProcessStart).catch(() => {});
 }
 
 async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<void> {
@@ -1233,6 +1485,7 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 	let stoppingPid: number | undefined;
 
 	await withLock(async () => {
+		await resolveEndpointLocked();
 		await resolveRuntimeDirLocked(onStatus);
 		await activateLease();
 		if (runtimeDisposed || shuttingDown) return;
@@ -1240,14 +1493,20 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 		await pruneLeases();
 
 		const state = await readState();
-		if (state?.pid && isPidAlive(state.pid) && (await looksLikeDs4Server(state.pid))) {
-			if (state.stopping) {
-				stoppingPid = state.pid;
+		if (await isServerStateForLiveDs4(state)) {
+			if (state!.stopping) {
+				stoppingPid = state!.pid;
 				return;
 			}
-			if (serverStateMatchesQuant(state, modelQuant)) return;
-			onStatus?.(`switching ds4-server to ${modelQuant} model`);
-			await stopServerPidLocked(state.pid, `switch ds4-server to ${modelQuant}`);
+			if (!serverStateMatchesEndpoint(state)) {
+				onStatus?.("moving ds4-server to reserved port");
+				await stopServerPidLocked(state!.pid, "move ds4-server to reserved port");
+			} else if (serverStateMatchesQuant(state, modelQuant)) {
+				return;
+			} else {
+				onStatus?.(`switching ds4-server to ${modelQuant} model`);
+				await stopServerPidLocked(state!.pid, `switch ds4-server to ${modelQuant}`);
+			}
 		}
 
 		if (state?.pid) await clearState();
@@ -1376,7 +1635,7 @@ function ds4Model(id: string, name: string) {
 function registerDs4Provider(pi: ExtensionAPI): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: "ds4.c local",
-		baseUrl: PROVIDER_BASE_URL,
+		baseUrl: providerBaseUrl(),
 		api: PROVIDER_API,
 		apiKey: configString("DS4_API_KEY", "dsv4-local"),
 		compat: {
@@ -1397,7 +1656,7 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 	} as any);
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	runtimeDisposed = false;
 	shuttingDown = false;
 	leaseStartedAt = Date.now();
@@ -1407,7 +1666,9 @@ export default function (pi: ExtensionAPI) {
 	startupModelQuant = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
+	currentEndpoint = undefined;
 
+	await initializeEndpoint();
 	registerDs4Provider(pi);
 	registerDs4Command(pi);
 	registerDs4Skill(pi);
