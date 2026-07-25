@@ -9,5 +9,6 @@
   "readyTimeoutMs": 600000,
   "serverBinary": null,
   "power": 70,
+  "ssdStreaming": false,
   "watchdogScript": null
 }

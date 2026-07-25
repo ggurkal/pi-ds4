@@ -85,6 +85,23 @@ function configNumber(envName: string, defaultValue: number): number {
 	return number;
 }
 
+function configBoolean(envName: string, defaultValue: boolean): boolean {
+	const value = settingValue(envName);
+	if (value === undefined || value === null || value === "") return defaultValue;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "number") {
+		if (value === 0) return false;
+		if (value === 1) return true;
+		throw new Error(`${envName} must be a boolean in the environment or ${SETTINGS_FILE}`);
+	}
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "true" || normalized === "1") return true;
+		if (normalized === "false" || normalized === "0") return false;
+	}
+	throw new Error(`${envName} must be a boolean in the environment or ${SETTINGS_FILE}`);
+}
+
 function selectedProtocol(): ProviderProtocol {
 	const raw = configString("DS4_PROTOCOL", "openai")?.toLowerCase();
 	switch (raw) {
@@ -113,6 +130,7 @@ const API_BASE_URL = `${BASE_URL}/v1`;
 const PROVIDER_API = selectedProtocol();
 const PROVIDER_BASE_URL = PROVIDER_API === "anthropic-messages" ? BASE_URL : API_BASE_URL;
 const SERVER_POWER = configNumber("DS4_POWER", 100);
+const SERVER_SSD_STREAMING = configBoolean("DS4_SSD_STREAMING", false);
 const SERVER_BASE_ARGS = ["--ctx", "100000", "--kv-disk-space-mb", "8192"];
 const HEARTBEAT_MS = 10_000;
 const LEASE_TTL_MS = 45_000;
@@ -309,8 +327,17 @@ async function selectDownloadTarget(runtimeDir: string, modelQuant: ModelQuant):
 	return targets[0];
 }
 
-function serverArgsForModel(modelQuant: ModelQuant, modelPath: string, power: number): string[] {
-	return ["--model", modelPath, ...SERVER_BASE_ARGS, "--kv-disk-dir", kvDirForQuant(modelQuant), "--power", String(power)];
+function serverArgsForModel(modelQuant: ModelQuant, modelPath: string, power: number, ssdStreaming: boolean): string[] {
+	return [
+		"--model",
+		modelPath,
+		...SERVER_BASE_ARGS,
+		"--kv-disk-dir",
+		kvDirForQuant(modelQuant),
+		"--power",
+		String(power),
+		...(ssdStreaming ? ["--ssd-streaming"] : []),
+	];
 }
 
 function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: ModelQuant): boolean {
@@ -1177,7 +1204,13 @@ async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallb
 	throw new Error(`Timed out waiting for ds4-server at ${API_BASE_URL}; see ${LOG_FILE}`);
 }
 
-async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, modelPath: string, power: number): Promise<void> {
+async function startServerLocked(
+	runtimeDir: string,
+	modelQuant: ModelQuant,
+	modelPath: string,
+	power: number,
+	ssdStreaming: boolean,
+): Promise<void> {
 	const binary = configString("DS4_SERVER_BINARY") ?? join(runtimeDir, "ds4-server");
 	try {
 		await access(binary, constants.X_OK);
@@ -1195,7 +1228,7 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 
 	const kvDir = kvDirForQuant(modelQuant);
 	await mkdir(kvDir, { recursive: true });
-	const serverArgs = serverArgsForModel(modelQuant, modelPath, power);
+	const serverArgs = serverArgsForModel(modelQuant, modelPath, power, ssdStreaming);
 
 	await appendLog(`\n[${new Date().toISOString()}] start ds4-server (${modelQuant})\n$ ${[binary, ...serverArgs].map(shellQuote).join(" ")}\n`);
 	const logFd = openSync(LOG_FILE, "a");
@@ -1233,7 +1266,12 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 	await writeJsonAtomic(STATE_FILE, state);
 }
 
-async function ensureServerManagedInner(modelQuant: ModelQuant, power: number, onStatus?: StatusCallback): Promise<void> {
+async function ensureServerManagedInner(
+	modelQuant: ModelQuant,
+	power: number,
+	ssdStreaming: boolean,
+	onStatus?: StatusCallback,
+): Promise<void> {
 	if (runtimeDisposed || shuttingDown) return;
 	let stoppingPid: number | undefined;
 
@@ -1274,7 +1312,7 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, power: number, o
 		if (runtimeDisposed || shuttingDown) return;
 
 		onStatus?.(`starting ds4-server (${modelQuant})`);
-		await startServerLocked(runtimeDir, modelQuant, modelPath, power);
+		await startServerLocked(runtimeDir, modelQuant, modelPath, power, ssdStreaming);
 	}, STARTUP_LOCK_TIMEOUT_MS, true);
 
 	if (runtimeDisposed || shuttingDown) return;
@@ -1288,20 +1326,25 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, power: number, o
 			const state = await readState();
 			if (state?.pid === stoppingPid && !isPidAlive(stoppingPid)) await clearState();
 		}, LOCK_TIMEOUT_MS);
-		return ensureServerManagedInner(modelQuant, power, onStatus);
+		return ensureServerManagedInner(modelQuant, power, ssdStreaming, onStatus);
 	}
 
 	await waitForServerReady(modelQuant, onStatus);
 }
 
-function ensureServerManaged(modelQuant: ModelQuant, power: number, onStatus?: StatusCallback): Promise<void> {
+function ensureServerManaged(
+	modelQuant: ModelQuant,
+	power: number,
+	ssdStreaming: boolean,
+	onStatus?: StatusCallback,
+): Promise<void> {
 	if (startupPromise) {
 		if (startupModelQuant === modelQuant) return startupPromise;
-		return startupPromise.catch(() => {}).then(() => ensureServerManaged(modelQuant, power, onStatus));
+		return startupPromise.catch(() => {}).then(() => ensureServerManaged(modelQuant, power, ssdStreaming, onStatus));
 	}
 
 	startupModelQuant = modelQuant;
-	const promise = ensureServerManagedInner(modelQuant, power, onStatus).finally(() => {
+	const promise = ensureServerManagedInner(modelQuant, power, ssdStreaming, onStatus).finally(() => {
 		if (startupPromise === promise) {
 			startupPromise = undefined;
 			startupModelQuant = undefined;
@@ -1449,7 +1492,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			notifyStatus?.("preparing ds4-server");
-			await ensureServerManaged(modelQuant, power, notifyStatus);
+			await ensureServerManaged(modelQuant, power, SERVER_SSD_STREAMING, notifyStatus);
 			if (!alreadyReady) ctx.ui.notify("ds4-server ready", "info");
 		} catch (error) {
 			ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");

@@ -54,7 +54,12 @@
 
     "power": { "$ref": "#/$defs/powerPercent" },
     "DS4_POWER": { "$ref": "#/$defs/powerPercent" },
-    "ds4_power": { "$ref": "#/$defs/powerPercent" }
+    "ds4_power": { "$ref": "#/$defs/powerPercent" },
+
+    "ssdStreaming": { "$ref": "#/$defs/nullableBoolean" },
+    "DS4_SSD_STREAMING": { "$ref": "#/$defs/nullableBoolean" },
+    "ssd_streaming": { "$ref": "#/$defs/nullableBoolean" },
+    "ds4_ssd_streaming": { "$ref": "#/$defs/nullableBoolean" }
   },
   "$defs": {
     "nullableString": {
@@ -64,6 +69,9 @@
       "type": ["number", "string", "null"],
       "description": "Number of milliseconds. Strings must parse as finite numbers."
     },
+    "nullableBoolean": {
+      "type": ["boolean", "null"]
+    }
     "protocol": {
       "type": ["string", "null"],
       "enum": [
@@ -88,6 +96,6 @@
       "minimum": 1,
       "maximum": 100,
       "description": "GPU duty cycle percentage (1..100). Default: 100 (full speed). Passed as --power N to ds4-server."
-    }
+    },
   }
 }
