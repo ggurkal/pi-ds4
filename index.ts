@@ -112,8 +112,8 @@ const BASE_URL = "http://127.0.0.1:8000";
 const API_BASE_URL = `${BASE_URL}/v1`;
 const PROVIDER_API = selectedProtocol();
 const PROVIDER_BASE_URL = PROVIDER_API === "anthropic-messages" ? BASE_URL : API_BASE_URL;
+const SERVER_POWER = configNumber("DS4_POWER", 100);
 const SERVER_BASE_ARGS = ["--ctx", "100000", "--kv-disk-space-mb", "8192"];
-
 const HEARTBEAT_MS = 10_000;
 const LEASE_TTL_MS = 45_000;
 const LOCK_STALE_MS = 60_000;
@@ -279,6 +279,11 @@ function kvDirForQuant(modelQuant: ModelQuant): string {
 	return modelQuant === "q2-imatrix" ? join(DS4_DIR, "kv-q2-imatrix") : KV_DIR;
 }
 
+function powerForServer(power: number): number {
+	if (power >= 1 && power <= 100) return power;
+	throw new Error(`Power setting must be between 1 and 100; got ${SERVER_POWER}`);
+}
+
 function downloadTargetsForQuant(modelQuant: ModelQuant): string[] {
 	modelQuant = canonicalModelQuant(modelQuant);
 	return modelQuant === "q4" ? ["q4-imatrix", "q4"] : ["q2-imatrix", "q2"];
@@ -304,8 +309,8 @@ async function selectDownloadTarget(runtimeDir: string, modelQuant: ModelQuant):
 	return targets[0];
 }
 
-function serverArgsForModel(modelQuant: ModelQuant, modelPath: string): string[] {
-	return ["--model", modelPath, ...SERVER_BASE_ARGS, "--kv-disk-dir", kvDirForQuant(modelQuant)];
+function serverArgsForModel(modelQuant: ModelQuant, modelPath: string, power: number): string[] {
+	return ["--model", modelPath, ...SERVER_BASE_ARGS, "--kv-disk-dir", kvDirForQuant(modelQuant), "--power", String(power)];
 }
 
 function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: ModelQuant): boolean {
@@ -1172,7 +1177,7 @@ async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallb
 	throw new Error(`Timed out waiting for ds4-server at ${API_BASE_URL}; see ${LOG_FILE}`);
 }
 
-async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, modelPath: string): Promise<void> {
+async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, modelPath: string, power: number): Promise<void> {
 	const binary = configString("DS4_SERVER_BINARY") ?? join(runtimeDir, "ds4-server");
 	try {
 		await access(binary, constants.X_OK);
@@ -1190,7 +1195,7 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 
 	const kvDir = kvDirForQuant(modelQuant);
 	await mkdir(kvDir, { recursive: true });
-	const serverArgs = serverArgsForModel(modelQuant, modelPath);
+	const serverArgs = serverArgsForModel(modelQuant, modelPath, power);
 
 	await appendLog(`\n[${new Date().toISOString()}] start ds4-server (${modelQuant})\n$ ${[binary, ...serverArgs].map(shellQuote).join(" ")}\n`);
 	const logFd = openSync(LOG_FILE, "a");
@@ -1228,7 +1233,7 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 	await writeJsonAtomic(STATE_FILE, state);
 }
 
-async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<void> {
+async function ensureServerManagedInner(modelQuant: ModelQuant, power: number, onStatus?: StatusCallback): Promise<void> {
 	if (runtimeDisposed || shuttingDown) return;
 	let stoppingPid: number | undefined;
 
@@ -1269,7 +1274,7 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 		if (runtimeDisposed || shuttingDown) return;
 
 		onStatus?.(`starting ds4-server (${modelQuant})`);
-		await startServerLocked(runtimeDir, modelQuant, modelPath);
+		await startServerLocked(runtimeDir, modelQuant, modelPath, power);
 	}, STARTUP_LOCK_TIMEOUT_MS, true);
 
 	if (runtimeDisposed || shuttingDown) return;
@@ -1283,20 +1288,20 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 			const state = await readState();
 			if (state?.pid === stoppingPid && !isPidAlive(stoppingPid)) await clearState();
 		}, LOCK_TIMEOUT_MS);
-		return ensureServerManagedInner(modelQuant, onStatus);
+		return ensureServerManagedInner(modelQuant, power, onStatus);
 	}
 
 	await waitForServerReady(modelQuant, onStatus);
 }
 
-function ensureServerManaged(modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<void> {
+function ensureServerManaged(modelQuant: ModelQuant, power: number, onStatus?: StatusCallback): Promise<void> {
 	if (startupPromise) {
 		if (startupModelQuant === modelQuant) return startupPromise;
-		return startupPromise.catch(() => {}).then(() => ensureServerManaged(modelQuant, onStatus));
+		return startupPromise.catch(() => {}).then(() => ensureServerManaged(modelQuant, power, onStatus));
 	}
 
 	startupModelQuant = modelQuant;
-	const promise = ensureServerManagedInner(modelQuant, onStatus).finally(() => {
+	const promise = ensureServerManagedInner(modelQuant, power, onStatus).finally(() => {
 		if (startupPromise === promise) {
 			startupPromise = undefined;
 			startupModelQuant = undefined;
@@ -1423,6 +1428,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!modelQuant) return;
 
+		let power: number;
+		try {
+			power = powerForServer(SERVER_POWER);
+		} catch (error) {
+			ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
+			throw error;
+		}
+
 		const alreadyReady = await checkHttpReadyForQuant(modelQuant);
 		let lastNotification: string | undefined;
 		const notifyStatus: StatusCallback | undefined = alreadyReady
@@ -1436,7 +1449,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			notifyStatus?.("preparing ds4-server");
-			await ensureServerManaged(modelQuant, notifyStatus);
+			await ensureServerManaged(modelQuant, power, notifyStatus);
 			if (!alreadyReady) ctx.ui.notify("ds4-server ready", "info");
 		} catch (error) {
 			ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
