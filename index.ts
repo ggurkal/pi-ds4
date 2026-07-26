@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
@@ -182,7 +182,7 @@ type StatusCallback = (message: string | undefined) => void;
 type RunLoggedOptions = { onStatus?: StatusCallback; progressPrefix?: string };
 
 type LogTui = { terminal: { rows: number }; requestRender: (force?: boolean) => void };
-type LogTheme = { fg: (color: string, text: string) => string };
+type LogTheme = { fg: (color: ThemeColor, text: string) => string };
 type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
 
 const WATCHDOG_SCRIPT_NAME = "ds4-watchdog.sh";
@@ -1332,7 +1332,7 @@ async function ensureServerManagedInner(
 	await waitForServerReady(modelQuant, onStatus);
 }
 
-function ensureServerManaged(
+async function ensureServerManaged(
 	modelQuant: ModelQuant,
 	power: number,
 	ssdStreaming: boolean,
