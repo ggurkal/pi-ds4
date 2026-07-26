@@ -10,5 +10,7 @@
   "serverBinary": null,
   "power": 70,
   "ssdStreaming": false,
-  "watchdogScript": null
+  "watchdogScript": null,
+  "remoteHost": null,
+  "remotePort": null
 }

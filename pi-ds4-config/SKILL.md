@@ -29,8 +29,20 @@ Power example (quieter, cooler):
   "protocol": "openai-responses",
   "power": 50
 }
-
 ```
+
+Client-only example (connect to an existing ds4-server elsewhere):
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
+  "remoteHost": "10.0.0.5",
+  "remotePort": 8001
+}
+```
+
+Either `remoteHost` or `remotePort` activates client-only mode; set both to `null` for managed mode. Pi registers one model (`ds4 (remote)`) and does not download, build, spawn, or supervise a local server. Connection is plain HTTP only. `protocol`, `apiKey`, and `readyTimeoutMs` still apply; lifecycle settings (`power`, `ssdStreaming`, `modelQuant`, `runtimeDir`, `serverBinary`, `supportRepo`, `supportBranch`, `watchdogScript`) are ignored. `/ds4` reports the configured endpoint instead of opening the local log.
+
 Common settings:
 
 - `protocol`: `openai` (default), `openai-responses`, or `anthropic`
@@ -42,5 +54,6 @@ Common settings:
 - `supportRepo` / `supportBranch`: runtime checkout source
 - `serverBinary` / `watchdogScript`: custom executable/script paths
 - `apiKey`: token Pi sends to the local provider (default `dsv4-local`)
+- `remoteHost` / `remotePort`: connect to an existing ds4-server instead of managing one locally (client-only mode; plain HTTP only)
 
 After editing, run `/reload` or restart pi. Use `/ds4` to inspect the live ds4 log.

@@ -59,7 +59,17 @@
     "ssdStreaming": { "$ref": "#/$defs/nullableBoolean" },
     "DS4_SSD_STREAMING": { "$ref": "#/$defs/nullableBoolean" },
     "ssd_streaming": { "$ref": "#/$defs/nullableBoolean" },
-    "ds4_ssd_streaming": { "$ref": "#/$defs/nullableBoolean" }
+    "ds4_ssd_streaming": { "$ref": "#/$defs/nullableBoolean" },
+
+    "remoteHost": { "$ref": "#/$defs/nullableString" },
+    "remote_host": { "$ref": "#/$defs/nullableString" },
+    "DS4_REMOTE_HOST": { "$ref": "#/$defs/nullableString" },
+    "ds4_remote_host": { "$ref": "#/$defs/nullableString" },
+
+    "remotePort": { "$ref": "#/$defs/nullablePort" },
+    "remote_port": { "$ref": "#/$defs/nullablePort" },
+    "DS4_REMOTE_PORT": { "$ref": "#/$defs/nullablePort" },
+    "ds4_remote_port": { "$ref": "#/$defs/nullablePort" }
   },
   "$defs": {
     "nullableString": {
@@ -71,7 +81,13 @@
     },
     "nullableBoolean": {
       "type": ["boolean", "null"]
-    }
+    },
+    "nullablePort": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "TCP port number from 1 through 65535."
+    },
     "protocol": {
       "type": ["string", "null"],
       "enum": [
@@ -96,6 +112,6 @@
       "minimum": 1,
       "maximum": 100,
       "description": "GPU duty cycle percentage (1..100). Default: 100 (full speed). Passed as --power N to ds4-server."
-    },
+    }
   }
 }

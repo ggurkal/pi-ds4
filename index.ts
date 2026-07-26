@@ -102,6 +102,11 @@ function configBoolean(envName: string, defaultValue: boolean): boolean {
 	throw new Error(`${envName} must be a boolean in the environment or ${SETTINGS_FILE}`);
 }
 
+function hasSetting(envName: string): boolean {
+	const value = settingValue(envName);
+	return value !== undefined && value !== null;
+}
+
 function selectedProtocol(): ProviderProtocol {
 	const raw = configString("DS4_PROTOCOL", "openai")?.toLowerCase();
 	switch (raw) {
@@ -125,7 +130,10 @@ function selectedProtocol(): ProviderProtocol {
 const SUPPORT_REPO = configString("DS4_SUPPORT_REPO", "https://github.com/antirez/ds4")!;
 const SUPPORT_BRANCH = configString("DS4_SUPPORT_BRANCH", "main")!;
 
-const BASE_URL = "http://127.0.0.1:8000";
+const CLIENT_ONLY = hasSetting("DS4_REMOTE_HOST") || hasSetting("DS4_REMOTE_PORT");
+const REMOTE_HOST = configString("DS4_REMOTE_HOST", "127.0.0.1")!;
+const REMOTE_PORT = configNumber("DS4_REMOTE_PORT", 8000);
+const BASE_URL = CLIENT_ONLY ? `http://${REMOTE_HOST}:${REMOTE_PORT}` : "http://127.0.0.1:8000";
 const API_BASE_URL = `${BASE_URL}/v1`;
 const PROVIDER_API = selectedProtocol();
 const PROVIDER_BASE_URL = PROVIDER_API === "anthropic-messages" ? BASE_URL : API_BASE_URL;
@@ -193,6 +201,7 @@ const WATCHDOG_SCRIPT = WATCHDOG_SCRIPT_CONFIG
 
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let startupPromise: Promise<void> | undefined;
+let remoteReadyPromise: Promise<void> | undefined;
 let startupModelQuant: ModelQuant | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
@@ -1204,6 +1213,37 @@ async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallb
 	throw new Error(`Timed out waiting for ds4-server at ${API_BASE_URL}; see ${LOG_FILE}`);
 }
 
+async function waitForRemoteServerReady(onStatus?: StatusCallback): Promise<void> {
+	const started = Date.now();
+	let lastStatus = 0;
+
+	while (Date.now() - started < READY_TIMEOUT_MS) {
+		if (runtimeDisposed || shuttingDown) return;
+		if (await checkHttpReady()) return;
+
+		if (Date.now() - lastStatus > 10_000) {
+			onStatus?.(`waiting for ds4-server at ${BASE_URL}`);
+			lastStatus = Date.now();
+		}
+		await sleep(1_000);
+	}
+
+	throw new Error(`Timed out waiting for ds4-server at ${BASE_URL}`);
+}
+
+function ensureRemoteServerReady(onStatus?: StatusCallback): {
+	promise: Promise<void>;
+	owner: boolean;
+} {
+	if (remoteReadyPromise) return { promise: remoteReadyPromise, owner: false };
+
+	const promise = waitForRemoteServerReady(onStatus).finally(() => {
+		if (remoteReadyPromise === promise) remoteReadyPromise = undefined;
+	});
+	remoteReadyPromise = promise;
+	return { promise, owner: true };
+}
+
 async function startServerLocked(
 	runtimeDir: string,
 	modelQuant: ModelQuant,
@@ -1372,6 +1412,11 @@ function registerDs4Command(pi: ExtensionAPI): void {
 	pi.registerCommand("ds4", {
 		description: "Show the live ds4-server log",
 		handler: async (_args, ctx) => {
+			if (CLIENT_ONLY) {
+				ctx.ui.notify(`no local log; client-only endpoint configured at ${BASE_URL}`, "info");
+				return;
+			}
+
 			if (!ctx.hasUI) {
 				ctx.ui.notify(`ds4 log: ${LOG_FILE}`, "info");
 				return;
@@ -1422,8 +1467,10 @@ function ds4Model(id: string, name: string) {
 }
 
 function registerDs4Provider(pi: ExtensionAPI): void {
+	const providerLocation = CLIENT_ONLY ? "remote" : "local";
+
 	pi.registerProvider(PROVIDER_ID, {
-		name: "ds4.c local",
+		name: `ds4.c ${providerLocation}`,
 		baseUrl: PROVIDER_BASE_URL,
 		api: PROVIDER_API,
 		apiKey: configString("DS4_API_KEY", "dsv4-local"),
@@ -1438,10 +1485,12 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 			requiresReasoningContentOnAssistantMessages: true,
 			...(PROVIDER_API === "anthropic-messages" ? { supportsEagerToolInputStreaming: false } : {}),
 		},
-		models: [
-			ds4Model(MODEL_ID, "DeepSeek V4 Flash (ds4.c local)"),
-			ds4Model(Q2_IMATRIX_MODEL_ID, "DeepSeek V4 Flash q2 imatrix (ds4.c local)"),
-		],
+		models: CLIENT_ONLY
+			? [ds4Model(MODEL_ID, "ds4 (remote)")]
+			: [
+					ds4Model(MODEL_ID, "DeepSeek V4 Flash (ds4.c local)"),
+					ds4Model(Q2_IMATRIX_MODEL_ID, "DeepSeek V4 Flash q2 imatrix (ds4.c local)"),
+				],
 	} as any);
 }
 
@@ -1452,6 +1501,7 @@ export default function (pi: ExtensionAPI) {
 	leaseActive = false;
 	watchdogStarted = false;
 	startupPromise = undefined;
+	remoteReadyPromise = undefined;
 	startupModelQuant = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
@@ -1462,6 +1512,28 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_ID) return;
+
+		if (CLIENT_ONLY) {
+			if (await checkHttpReady()) return;
+
+			let lastNotification: string | undefined;
+			const notifyStatus: StatusCallback = (message) => {
+				if (!message || message === lastNotification) return;
+				lastNotification = message;
+				ctx.ui.notify(message, "info");
+			};
+
+			const { promise, owner } = ensureRemoteServerReady(notifyStatus);
+			try {
+				await promise;
+				if (owner) ctx.ui.notify(`connected to ds4-server at ${BASE_URL}`, "info");
+			} catch (error) {
+				if (owner) ctx.ui.notify(`cannot reach ds4-server at ${BASE_URL}`, "error");
+				throw error;
+			}
+			return;
+		}
+
 		let modelQuant: ModelQuant | undefined;
 		try {
 			modelQuant = modelQuantForModelId(ctx.model?.id);
@@ -1512,6 +1584,8 @@ export default function (pi: ExtensionAPI) {
 		// Session switches and /reload immediately create another extension instance
 		// in the same pi process. Keep the lease for those hand-offs.
 		if (event.reason !== "quit") return;
+
+		if (CLIENT_ONLY) return;
 
 		shuttingDown = true;
 		try {

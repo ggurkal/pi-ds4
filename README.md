@@ -62,6 +62,31 @@ camel-case key without `DS4_` (for example `"readyTimeoutMs"`), or the lower
 snake-case key without `DS4_` (for example `"ready_timeout_ms"`). Environment
 variables win over the settings file.
 
+### Client-only mode
+
+Set `remoteHost` and/or `remotePort` to connect to an existing `ds4-server`
+instead of downloading, building, spawning, or supervising one locally. Either
+key activates client-only mode; set both to `null` (or omit them) for managed
+mode. Connection uses plain HTTP only.
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
+  "remoteHost": "10.0.0.5",
+  "remotePort": 8001
+}
+```
+
+In client-only mode pi registers a single model, `ds4 (remote)`, and sends
+provider requests to `http://{remoteHost}:{remotePort}`. The extension does not
+detect which quant the remote server loaded. `protocol`, `apiKey`, and
+`readyTimeoutMs` still apply. Settings that only affect local server lifecycle
+(`power`, `ssdStreaming`, `modelQuant`, `runtimeDir`, `serverBinary`,
+`supportRepo`, `supportBranch`, `watchdogScript`) are ignored. `/ds4` reports
+the configured endpoint instead of opening the local log.
+
+### Managed mode settings
+
 - `DS4_PROTOCOL`: Pi wire protocol. Supported values are `openai` (default,
   OpenAI Chat Completions), `openai-responses`, and `anthropic`.
 - `DS4_SUPPORT_REPO`: runtime repo URL (default `https://github.com/antirez/ds4`)
@@ -73,6 +98,8 @@ variables win over the settings file.
 - `DS4_SERVER_BINARY`: custom `ds4-server` binary path
 - `DS4_WATCHDOG_SCRIPT`: custom watchdog script path
 - `DS4_API_KEY`: provider API key/token sent by Pi (default `dsv4-local`)
+- `DS4_REMOTE_HOST`: remote `ds4-server` host for client-only mode (default `127.0.0.1`)
+- `DS4_REMOTE_PORT`: remote `ds4-server` port for client-only mode (default `8000`)
 
 See `settings.example.json` for a complete example with a JSON schema reference.
 A minimal `~/.pi/ds4/settings.json` can look like this:
