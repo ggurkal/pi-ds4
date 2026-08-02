@@ -1,6 +1,6 @@
 ---
 name: pi-ds4-config
-description: Reconfigure pi-ds4/ds4 local DeepSeek V4 Flash by editing ~/.pi/ds4/settings.json. Use when the user asks how to configure, reconfigure, change settings, switch model quant/protocol/runtime, or debug pi-ds4 configuration.
+description: Reconfigure pi-ds4 for local DeepSeek V4 Flash, DeepSeek V4 Pro, and GLM 5.2 models. Use when the user asks how to configure, download models, change protocol/runtime settings, or debug pi-ds4.
 ---
 
 # pi-ds4 configuration
@@ -15,7 +15,6 @@ Minimal example:
 {
   "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
   "protocol": "openai-responses",
-  "modelQuant": "q2-q4-imatrix",
   "contextTokens": 393216,
   "readyTimeoutMs": 900000
 }
@@ -24,8 +23,7 @@ Minimal example:
 Common settings:
 
 - `protocol`: `openai`, `openai-responses` (default), or `anthropic`
-- `modelQuant`: force `q2`/`q2-imatrix`, `q2-q4-imatrix`, or `q4`/`q4-imatrix` for `ds4/deepseek-v4-flash`
-- `contextTokens`: ds4/Pi context size (default `393216`, enabling Think Max)
+- `contextTokens`: ds4/Pi context ceiling (default `393216`; GLM models use their lower supported limit)
 - `autoUpdate`: fast-forward the package-managed ds4 checkout before use (default `true`; local/external checkouts are untouched)
 - `readyTimeoutMs`: server startup timeout in ms
 - `runtimeDir`: existing antirez/ds4 checkout instead of `~/.pi/ds4/support`
@@ -33,4 +31,4 @@ Common settings:
 - `serverBinary` / `watchdogScript`: custom executable/script paths
 - `apiKey`: token Pi sends to the local provider (default `dsv4-local`)
 
-After editing, run `/reload` or restart pi. Use `/ds4` to inspect the live ds4 log.
+After editing, run `/reload` or restart Pi. No model is installed or registered automatically. Use `/ds4` to download an explicit DeepSeek V4 Flash, DeepSeek V4 Pro, or GLM 5.2 variant and to view the log or control the server. Completed downloads are registered automatically in Pi's model catalogue.

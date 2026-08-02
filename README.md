@@ -1,27 +1,39 @@
 # pi-ds4
 
-Pi provider extension for running [antirez/ds4](https://github.com/antirez/ds4)
-as a local DeepSeek V4 Flash model.  The goal here is to see how good the UX
-and behavior can be around local models.
+Pi provider extension for running the model families supported by
+[antirez/ds4](https://github.com/antirez/ds4): DeepSeek V4 Flash, DeepSeek V4
+Pro, and GLM 5.2. The goal here is to see how good the UX and behavior can be
+around local models.
 
-The extension registers automatic, q2-imatrix, and mixed q2/q4-imatrix
-DeepSeek V4 Flash models for `/model`, starts `ds4-server`
-on demand on a remembered random localhost port, downloads/builds the runtime if
-needed, keeps a per-pi-process lease, and stops the server via a bundled watchdog
-when no clients are left.
+No model is registered or downloaded automatically. Run `/ds4`, choose
+**Download model**, and explicitly select a model. Completed downloads are
+registered immediately and rediscovered on future Pi starts. Selecting one in
+`/model` starts `ds4-server` on demand on a remembered random localhost port.
+A per-Pi-process lease and bundled watchdog stop the server when no clients are
+left.
 
-## Requirements and Behavior
+## Models
 
-You will need a Mac with at least 96GB of RAM. The default
-`ds4/deepseek-v4-flash` model installs q2-imatrix on 96GB machines, the newer
-higher-quality mixed q2/q4-imatrix release on 128GB machines, and q4-imatrix on
-machines with 256GB or more. Select `ds4/deepseek-v4-flash-q2-imatrix` or
-`ds4/deepseek-v4-flash-q2-q4-imatrix` to force a particular smaller quant.
+The short model IDs retain the family and quantization:
+
+| Pi model | Family and quant | Resident RAM |
+|---|---|---:|
+| `ds4/dsv4-flash-q2` | DeepSeek V4 Flash Q2 imatrix | ≥96 GB |
+| `ds4/dsv4-flash-q2q4` | DeepSeek V4 Flash mixed Q2/Q4 imatrix | ≥128 GB |
+| `ds4/dsv4-flash-q4` | DeepSeek V4 Flash Q4 imatrix | ≥256 GB |
+| `ds4/dsv4-pro-q2` | DeepSeek V4 Pro Q2 imatrix | ≥512 GB |
+| `ds4/glm52-q4-xl` | GLM 5.2 Unsloth Q4 XL, 11 shards | ≥512 GB |
+| `ds4/glm52-iq2xxs` | GLM 5.2 antirez IQ2 XXS | ≥256 GB |
+| `ds4/glm52-q2` | GLM 5.2 antirez Q2 | ≥384 GB |
+| `ds4/glm52-q4` | GLM 5.2 antirez Q4 | ≥512 GB |
+
+These are conservative full-residency requirements. ds4's SSD-streaming and
+distributed modes can run some models with less RAM per machine, at different
+performance tradeoffs. The `/ds4` download menu shows the same RAM guidance.
 
 If you are signed into Hugging Face then your token is used for faster downloads.
-The server is compiled/started and models are downloaded automatically on first
-use. Package-managed ds4 checkouts are fast-forwarded before use so updates to
-ds4's model manifest pull in new uniquely named model releases. Local development
+Package-managed ds4 checkouts are fast-forwarded before use so updates to ds4's
+model manifest pull in new uniquely named model releases. Local development
 checkouts and explicit `runtimeDir` checkouts are never modified.
 
 ## Install
@@ -49,9 +61,7 @@ Then restart pi or run `/reload`.
 Runtime state is kept under `~/.pi/ds4`:
 
 - `support/` — shallow checkout of `https://github.com/antirez/ds4` (`main` by default)
-- `kv/` — on-disk KV cache for the q4 model choice
-- `kv-q2-imatrix/` — on-disk KV cache for the q2-imatrix model choice
-- `kv-q2-q4-imatrix/` — on-disk KV cache for the mixed q2/q4 model choice
+- `kv*` — per-model on-disk KV caches
 - `clients/` — active pi process leases
 - `port.json` — reserved random local port, guarded by the owning pi/server PID
 - `server.json` — live `ds4-server` PID, endpoint, and model state
@@ -74,9 +84,7 @@ variables win over the settings file.
 - `DS4_SUPPORT_REPO`: runtime repo URL (default `https://github.com/antirez/ds4`)
 - `DS4_SUPPORT_BRANCH`: runtime branch (default `main`)
 - `DS4_RUNTIME_DIR`: use an existing ds4 checkout instead of `~/.pi/ds4/support`
-- `DS4_MODEL_QUANT`: force `q2`/`q2-imatrix`, `q2-q4-imatrix`, or
-  `q4`/`q4-imatrix` for the default model choice (otherwise picked from memory)
-- `DS4_CONTEXT_TOKENS`: server and Pi context window (default `393216`, the
+- `DS4_CONTEXT_TOKENS`: server and Pi context-window ceiling (default `393216`, the
   minimum context at which ds4 enables DeepSeek V4 Think Max)
 - `DS4_AUTO_UPDATE`: fast-forward a package-managed ds4 checkout before use
   (default `true`; never affects local/external checkouts)
@@ -92,9 +100,21 @@ A minimal `~/.pi/ds4/settings.json` can look like this:
 {
   "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
   "protocol": "openai-responses",
-  "modelQuant": "q2-q4-imatrix",
   "readyTimeoutMs": 900000
 }
 ```
 
-Use `/ds4` inside pi to show the live ds4 log.
+Use `/ds4` inside Pi to open the management menu:
+
+- **See log** opens the live ds4 log viewer.
+- **Start server** or **Stop server** controls the managed server. Starting uses
+  the selected ds4 model or asks which installed model to load.
+- **Download model** lists all directly runnable DeepSeek V4 Flash, DeepSeek V4
+  Pro, and GLM 5.2 variants supported by ds4's downloader. Completed downloads
+  are registered immediately and appear in `/model`; they are also rediscovered
+  when Pi starts or refreshes its model catalogue.
+
+Distributed DeepSeek V4 Pro Q4 halves are intentionally not Pi models: neither
+half is independently runnable without a separately configured multi-host ds4
+topology. Optional MTP and DSpark files are acceleration components rather than
+standalone models.

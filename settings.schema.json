@@ -37,11 +37,6 @@
     "DS4_AUTO_UPDATE": { "$ref": "#/$defs/nullableBoolean" },
     "ds4_auto_update": { "$ref": "#/$defs/nullableBoolean" },
 
-    "modelQuant": { "$ref": "#/$defs/modelQuant" },
-    "model_quant": { "$ref": "#/$defs/modelQuant" },
-    "DS4_MODEL_QUANT": { "$ref": "#/$defs/modelQuant" },
-    "ds4_model_quant": { "$ref": "#/$defs/modelQuant" },
-
     "contextTokens": { "$ref": "#/$defs/nullableNumber" },
     "context_tokens": { "$ref": "#/$defs/nullableNumber" },
     "DS4_CONTEXT_TOKENS": { "$ref": "#/$defs/nullableNumber" },
@@ -88,10 +83,6 @@
         "messages",
         null
       ]
-    },
-    "modelQuant": {
-      "type": ["string", "null"],
-      "enum": ["q2", "q2-imatrix", "q2-q4", "q2-q4-imatrix", "q4", "q4-imatrix", null]
     }
   }
 }
