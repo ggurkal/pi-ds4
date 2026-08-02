@@ -80,6 +80,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PI_AGENT_DIR=${PI_CODING_AGENT_DIR:-"$HOME/.pi/agent"}
 EXTENSION_DIR="$PI_AGENT_DIR/extensions"
 EXTENSION_LINK="$EXTENSION_DIR/pi-ds4"
+SKILL_DIR="$PI_AGENT_DIR/skills"
+SKILL_LINK="$SKILL_DIR/pi-ds4-config"
 DS4_DIR="$HOME/.pi/ds4"
 SUPPORT_LINK="$DS4_DIR/support"
 
@@ -100,6 +102,11 @@ if [ ! -f "$ROOT/ds4-watchdog.sh" ]; then
     exit 1
 fi
 
+if [ ! -f "$ROOT/pi-ds4-config/SKILL.md" ]; then
+    echo "error: $ROOT/pi-ds4-config/SKILL.md not found" >&2
+    exit 1
+fi
+
 for file in download_model.sh Makefile ds4_server.c; do
     if [ ! -f "$DS4_CHECKOUT/$file" ]; then
         echo "error: $DS4_CHECKOUT does not look like a ds4 server checkout (missing $file)" >&2
@@ -107,8 +114,9 @@ for file in download_model.sh Makefile ds4_server.c; do
     fi
 done
 
-mkdir -p "$EXTENSION_DIR" "$DS4_DIR"
+mkdir -p "$EXTENSION_DIR" "$SKILL_DIR" "$DS4_DIR"
 ln -sfn "$ROOT" "$EXTENSION_LINK"
+ln -sfn "$ROOT/pi-ds4-config" "$SKILL_LINK"
 
 installed_support=0
 if [ -L "$SUPPORT_LINK" ]; then
@@ -152,6 +160,9 @@ fi
 
 echo "Installed pi extension package symlink:"
 echo "  $EXTENSION_LINK -> $ROOT"
+echo
+echo "Installed pi skill symlink:"
+echo "  $SKILL_LINK -> $ROOT/pi-ds4-config"
 echo
 echo "Installed ds4 runtime checkout symlink:"
 echo "  $SUPPORT_LINK -> $DS4_CHECKOUT"

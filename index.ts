@@ -1,8 +1,13 @@
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ProviderModelConfig,
-} from "@earendil-works/pi-coding-agent";
+import {
+	createProvider,
+	lazyStream,
+	type Model,
+	type Provider,
+	type ProviderStreams,
+} from "@earendil-works/pi-ai";
+// Pi's extension loader exposes the built-in lazy API factories through this entry point.
+import { anthropicMessagesApi, openAICompletionsApi, openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
@@ -327,6 +332,7 @@ let leaseActive = false;
 let watchdogStarted = false;
 let runtimeDisposed = false;
 let shuttingDown = false;
+let providerStatusCallback: StatusCallback | undefined;
 let writeSeq = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1738,14 +1744,6 @@ async function stopServerIfUnused(): Promise<void> {
 	await removeOwnLease();
 }
 
-function registerDs4Skill(pi: ExtensionAPI): void {
-	pi.on("resources_discover", () => {
-		return {
-			skillPaths: [join(EXTENSION_DIR, "pi-ds4-config", "SKILL.md")],
-		};
-	});
-}
-
 async function isServerRunning(): Promise<boolean> {
 	const state = await readState();
 	return !!state && !state.stopping && (await isServerStateForLiveDs4(state));
@@ -1890,7 +1888,7 @@ function registerDs4Command(pi: ExtensionAPI): void {
 	});
 }
 
-function modelCompat(): ProviderModelConfig["compat"] {
+function modelCompat(): Model<ProviderProtocol>["compat"] {
 	if (PROVIDER_API === "openai-completions") {
 		return {
 			supportsStore: false,
@@ -1909,11 +1907,14 @@ function modelCompat(): ProviderModelConfig["compat"] {
 	return { supportsEagerToolInputStreaming: false };
 }
 
-function ds4Model(model: DownloadableModel): ProviderModelConfig {
+function ds4Model(model: DownloadableModel): Model<ProviderProtocol> {
 	const contextWindow = contextTokensForModel(model.key);
 	return {
 		id: model.key,
 		name: model.name,
+		api: PROVIDER_API,
+		provider: PROVIDER_ID,
+		baseUrl: providerBaseUrl(),
 		reasoning: true,
 		thinkingLevelMap: {
 			off: "none",
@@ -1932,22 +1933,83 @@ function ds4Model(model: DownloadableModel): ProviderModelConfig {
 	};
 }
 
-function registeredDs4Models(): ProviderModelConfig[] {
+function registeredDs4Models(): Model<ProviderProtocol>[] {
 	return DOWNLOADABLE_MODELS.filter((model) => installedModelKeys.has(model.key)).map(ds4Model);
 }
 
-function registerDs4Provider(pi: ExtensionAPI): void {
-	pi.registerProvider(PROVIDER_ID, {
+function protocolStreams(): ProviderStreams {
+	switch (PROVIDER_API) {
+		case "openai-completions":
+			return openAICompletionsApi();
+		case "openai-responses":
+			return openAIResponsesApi();
+		case "anthropic-messages":
+			return anthropicMessagesApi();
+	}
+}
+
+function managedStreams(upstream: ProviderStreams): ProviderStreams {
+	const prepare = (
+		model: Model<any>,
+		run: () => ReturnType<ProviderStreams["stream"]>,
+	) =>
+		lazyStream(model, async () => {
+			const modelKey = modelKeyForModelId(model.id);
+			if (!modelKey || !installedModelKeys.has(modelKey)) {
+				throw new Error(`ds4 model ${model.id} is not downloaded; use /ds4 first`);
+			}
+
+			const onStatus = (await checkHttpReadyForModel(modelKey)) ? undefined : providerStatusCallback;
+			try {
+				onStatus?.("preparing ds4-server");
+				await ensureServerManaged(modelKey, onStatus);
+				return run();
+			} finally {
+				onStatus?.(undefined);
+			}
+		});
+
+	return {
+		stream: (model, context, options) => prepare(model, () => upstream.stream(model, context, options)),
+		streamSimple: (model, context, options) => prepare(model, () => upstream.streamSimple(model, context, options)),
+	};
+}
+
+function createDs4Provider(): Provider<ProviderProtocol> {
+	const configuredApiKey = configString("DS4_API_KEY", "dsv4-local");
+	const provider = createProvider<ProviderProtocol>({
+		id: PROVIDER_ID,
 		name: "ds4.c local",
 		baseUrl: providerBaseUrl(),
-		api: PROVIDER_API,
-		apiKey: configString("DS4_API_KEY", "dsv4-local"),
-		models: registeredDs4Models(),
-		refreshModels: async () => {
-			installedModelKeys = await discoverInstalledModelKeys();
-			return registeredDs4Models();
+		auth: {
+			apiKey: {
+				name: "Local ds4 server",
+				async resolve({ credential }) {
+					return {
+						auth: { apiKey: credential?.key ?? configuredApiKey },
+						source: "local ds4-server",
+					};
+				},
+			},
 		},
+		models: registeredDs4Models(),
+		api: managedStreams(protocolStreams()),
 	});
+
+	// Local files are the catalog of record. Avoid createProvider's fetchModels
+	// store so a removed GGUF cannot be resurrected from a persisted model list.
+	return {
+		...provider,
+		getModels: registeredDs4Models,
+		async refreshModels({ signal }) {
+			const discovered = await discoverInstalledModelKeys();
+			if (!signal?.aborted) installedModelKeys = discovered;
+		},
+	};
+}
+
+function registerDs4Provider(pi: ExtensionAPI): void {
+	pi.registerProvider(createDs4Provider());
 }
 
 async function refreshDs4Provider(pi: ExtensionAPI): Promise<void> {
@@ -1966,45 +2028,27 @@ export default async function (pi: ExtensionAPI) {
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
 	runtimeCheckoutUpdated = false;
+	providerStatusCallback = undefined;
 	installedModelKeys = await discoverInstalledModelKeys();
 	currentEndpoint = undefined;
 
 	await initializeEndpoint();
 	registerDs4Provider(pi);
 	registerDs4Command(pi);
-	registerDs4Skill(pi);
 
-	pi.on("before_provider_request", async (_event, ctx) => {
-		if (ctx.model?.provider !== PROVIDER_ID) return;
-		const modelKey = modelKeyForModelId(ctx.model.id);
-		if (!modelKey || !installedModelKeys.has(modelKey)) {
-			throw new Error(`ds4 model ${ctx.model.id} is not downloaded; use /ds4 first`);
-		}
+	pi.on("before_agent_start", (_event, ctx) => {
+		providerStatusCallback =
+			ctx.model?.provider === PROVIDER_ID ? (message) => ctx.ui.setWorkingMessage(message) : undefined;
+	});
 
-		const alreadyReady = await checkHttpReadyForModel(modelKey);
-		let lastNotification: string | undefined;
-		const notifyStatus: StatusCallback | undefined = alreadyReady
-			? undefined
-			: (message) => {
-					if (!message || message === lastNotification) return;
-					if (/^ds4-server starting \(\d+s\)$/.test(message)) return;
-					lastNotification = message;
-					ctx.ui.notify(message, "info");
-				};
-
-		try {
-			notifyStatus?.("preparing ds4-server");
-			await ensureServerManaged(modelKey, notifyStatus);
-			await refreshDs4Provider(pi);
-			if (!alreadyReady) ctx.ui.notify("ds4-server ready", "info");
-		} catch (error) {
-			ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
-			throw error;
-		}
+	pi.on("agent_settled", (_event, ctx) => {
+		if (providerStatusCallback) ctx.ui.setWorkingMessage();
+		providerStatusCallback = undefined;
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
 		runtimeDisposed = true;
+		providerStatusCallback = undefined;
 		stopHeartbeat();
 		killActiveSetupChild();
 
