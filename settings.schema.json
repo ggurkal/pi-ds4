@@ -32,10 +32,20 @@
     "DS4_RUNTIME_DIR": { "$ref": "#/$defs/nullableString" },
     "ds4_runtime_dir": { "$ref": "#/$defs/nullableString" },
 
+    "autoUpdate": { "$ref": "#/$defs/nullableBoolean" },
+    "auto_update": { "$ref": "#/$defs/nullableBoolean" },
+    "DS4_AUTO_UPDATE": { "$ref": "#/$defs/nullableBoolean" },
+    "ds4_auto_update": { "$ref": "#/$defs/nullableBoolean" },
+
     "modelQuant": { "$ref": "#/$defs/modelQuant" },
     "model_quant": { "$ref": "#/$defs/modelQuant" },
     "DS4_MODEL_QUANT": { "$ref": "#/$defs/modelQuant" },
     "ds4_model_quant": { "$ref": "#/$defs/modelQuant" },
+
+    "contextTokens": { "$ref": "#/$defs/nullableNumber" },
+    "context_tokens": { "$ref": "#/$defs/nullableNumber" },
+    "DS4_CONTEXT_TOKENS": { "$ref": "#/$defs/nullableNumber" },
+    "ds4_context_tokens": { "$ref": "#/$defs/nullableNumber" },
 
     "readyTimeoutMs": { "$ref": "#/$defs/nullableNumber" },
     "ready_timeout_ms": { "$ref": "#/$defs/nullableNumber" },
@@ -58,7 +68,11 @@
     },
     "nullableNumber": {
       "type": ["number", "string", "null"],
-      "description": "Number of milliseconds. Strings must parse as finite numbers."
+      "description": "Strings must parse as finite numbers."
+    },
+    "nullableBoolean": {
+      "type": ["boolean", "number", "string", "null"],
+      "description": "Boolean or one of true/false, yes/no, on/off, or 1/0."
     },
     "protocol": {
       "type": ["string", "null"],
@@ -77,7 +91,7 @@
     },
     "modelQuant": {
       "type": ["string", "null"],
-      "enum": ["q2", "q2-imatrix", "q4", "q4-imatrix", null]
+      "enum": ["q2", "q2-imatrix", "q2-q4", "q2-q4-imatrix", "q4", "q4-imatrix", null]
     }
   }
 }

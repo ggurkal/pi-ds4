@@ -4,22 +4,25 @@ Pi provider extension for running [antirez/ds4](https://github.com/antirez/ds4)
 as a local DeepSeek V4 Flash model.  The goal here is to see how good the UX
 and behavior can be around local models.
 
-The extension registers `ds4/deepseek-v4-flash` and
-`ds4/deepseek-v4-flash-q2-imatrix` as models for `/model`, starts `ds4-server`
+The extension registers automatic, q2-imatrix, and mixed q2/q4-imatrix
+DeepSeek V4 Flash models for `/model`, starts `ds4-server`
 on demand on a remembered random localhost port, downloads/builds the runtime if
 needed, keeps a per-pi-process lease, and stops the server via a bundled watchdog
 when no clients are left.
 
 ## Requirements and Behavior
 
-You will need a mac with at least 128GB of RAM.  The default
-`ds4/deepseek-v4-flash` model installs the q2-imatrix model if you have 128GB
-of RAM and picks the q4-imatrix model if you have 256GB or more. Select
-`ds4/deepseek-v4-flash-q2-imatrix` to force the q2-imatrix model.
+You will need a Mac with at least 96GB of RAM. The default
+`ds4/deepseek-v4-flash` model installs q2-imatrix on 96GB machines, the newer
+higher-quality mixed q2/q4-imatrix release on 128GB machines, and q4-imatrix on
+machines with 256GB or more. Select `ds4/deepseek-v4-flash-q2-imatrix` or
+`ds4/deepseek-v4-flash-q2-q4-imatrix` to force a particular smaller quant.
 
-If you are signed into huggingface then your token is used for faster downloads.
+If you are signed into Hugging Face then your token is used for faster downloads.
 The server is compiled/started and models are downloaded automatically on first
-use.
+use. Package-managed ds4 checkouts are fast-forwarded before use so updates to
+ds4's model manifest pull in new uniquely named model releases. Local development
+checkouts and explicit `runtimeDir` checkouts are never modified.
 
 ## Install
 
@@ -48,6 +51,7 @@ Runtime state is kept under `~/.pi/ds4`:
 - `support/` — shallow checkout of `https://github.com/antirez/ds4` (`main` by default)
 - `kv/` — on-disk KV cache for the q4 model choice
 - `kv-q2-imatrix/` — on-disk KV cache for the q2-imatrix model choice
+- `kv-q2-q4-imatrix/` — on-disk KV cache for the mixed q2/q4 model choice
 - `clients/` — active pi process leases
 - `port.json` — reserved random local port, guarded by the owning pi/server PID
 - `server.json` — live `ds4-server` PID, endpoint, and model state
@@ -65,13 +69,17 @@ camel-case key without `DS4_` (for example `"readyTimeoutMs"`), or the lower
 snake-case key without `DS4_` (for example `"ready_timeout_ms"`). Environment
 variables win over the settings file.
 
-- `DS4_PROTOCOL`: Pi wire protocol. Supported values are `openai` (default,
-  OpenAI Chat Completions), `openai-responses`, and `anthropic`.
+- `DS4_PROTOCOL`: Pi wire protocol. Supported values are `openai`,
+  `openai-responses` (default and recommended), and `anthropic`.
 - `DS4_SUPPORT_REPO`: runtime repo URL (default `https://github.com/antirez/ds4`)
 - `DS4_SUPPORT_BRANCH`: runtime branch (default `main`)
 - `DS4_RUNTIME_DIR`: use an existing ds4 checkout instead of `~/.pi/ds4/support`
-- `DS4_MODEL_QUANT`: force `q2`/`q2-imatrix` or `q4`/`q4-imatrix` for the
-  default model choice (otherwise picked from system memory)
+- `DS4_MODEL_QUANT`: force `q2`/`q2-imatrix`, `q2-q4-imatrix`, or
+  `q4`/`q4-imatrix` for the default model choice (otherwise picked from memory)
+- `DS4_CONTEXT_TOKENS`: server and Pi context window (default `393216`, the
+  minimum context at which ds4 enables DeepSeek V4 Think Max)
+- `DS4_AUTO_UPDATE`: fast-forward a package-managed ds4 checkout before use
+  (default `true`; never affects local/external checkouts)
 - `DS4_READY_TIMEOUT_MS`: server startup timeout
 - `DS4_SERVER_BINARY`: custom `ds4-server` binary path
 - `DS4_WATCHDOG_SCRIPT`: custom watchdog script path
@@ -84,7 +92,7 @@ A minimal `~/.pi/ds4/settings.json` can look like this:
 {
   "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
   "protocol": "openai-responses",
-  "modelQuant": "q2-imatrix",
+  "modelQuant": "q2-q4-imatrix",
   "readyTimeoutMs": 900000
 }
 ```

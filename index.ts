@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
@@ -8,6 +8,7 @@ import {
 	appendFile,
 	mkdir,
 	readdir,
+	lstat,
 	open as openFile,
 	readFile,
 	realpath,
@@ -26,6 +27,7 @@ const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const PROVIDER_ID = "ds4";
 const MODEL_ID = "deepseek-v4-flash";
 const Q2_IMATRIX_MODEL_ID = "deepseek-v4-flash-q2-imatrix";
+const Q2_Q4_IMATRIX_MODEL_ID = "deepseek-v4-flash-q2-q4-imatrix";
 // Keep the historical typo for on-disk lease/state compatibility with older installs.
 const MANAGED_BY = "pi-sd4-provider";
 
@@ -88,8 +90,20 @@ function configNumber(envName: string, defaultValue: number): number {
 	return number;
 }
 
+function configBoolean(envName: string, defaultValue: boolean): boolean {
+	const value = settingValue(envName);
+	if (value === undefined || value === null || value === "") return defaultValue;
+	if (typeof value === "boolean") return value;
+	if (typeof value === "number") return value !== 0;
+	if (typeof value === "string") {
+		if (/^(1|true|yes|on)$/i.test(value)) return true;
+		if (/^(0|false|no|off)$/i.test(value)) return false;
+	}
+	throw new Error(`${envName} must be a boolean in the environment or ${SETTINGS_FILE}`);
+}
+
 function selectedProtocol(): ProviderProtocol {
-	const raw = configString("DS4_PROTOCOL", "openai")?.toLowerCase();
+	const raw = configString("DS4_PROTOCOL", "openai-responses")?.toLowerCase();
 	switch (raw) {
 		case "openai":
 		case "openai-completions":
@@ -113,7 +127,11 @@ const SUPPORT_BRANCH = configString("DS4_SUPPORT_BRANCH", "main")!;
 
 const SERVER_HOST = "127.0.0.1";
 const PROVIDER_API = selectedProtocol();
-const SERVER_BASE_ARGS = ["--ctx", "100000", "--kv-disk-space-mb", "8192"];
+const SERVER_CONTEXT_TOKENS = configNumber("DS4_CONTEXT_TOKENS", 393_216);
+if (!Number.isInteger(SERVER_CONTEXT_TOKENS) || SERVER_CONTEXT_TOKENS <= 0) {
+	throw new Error(`DS4_CONTEXT_TOKENS must be a positive integer in the environment or ${SETTINGS_FILE}`);
+}
+const SERVER_BASE_ARGS = ["--ctx", String(SERVER_CONTEXT_TOKENS), "--kv-disk-space-mb", "8192"];
 
 const HEARTBEAT_MS = 10_000;
 const LEASE_TTL_MS = 45_000;
@@ -130,7 +148,7 @@ const WATCHDOG_POLL_MS = 2_000;
 const PROGRESS_NOTIFY_MS = 750;
 const PROGRESS_MAX_CHARS = 160;
 
-type ModelQuant = "q2" | "q2-imatrix" | "q4";
+type ModelQuant = "q2" | "q2-imatrix" | "q2-q4-imatrix" | "q4";
 
 type ServerEndpoint = {
 	host: string;
@@ -206,6 +224,7 @@ let startupPromise: Promise<void> | undefined;
 let startupModelQuant: ModelQuant | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
+let runtimeCheckoutUpdated = false;
 let currentEndpoint: ServerEndpoint | undefined;
 let leaseStartedAt = Date.now();
 let ownProcessStart: string | undefined;
@@ -332,14 +351,20 @@ function truncateText(value: string, width: number, ellipsis = "", pad = false):
 function selectedDefaultModelQuant(): ModelQuant {
 	const forced = configString("DS4_MODEL_QUANT")?.toLowerCase();
 	if (forced === "q2" || forced === "q2-imatrix") return "q2-imatrix";
+	if (forced === "q2-q4" || forced === "q2-q4-imatrix") return "q2-q4-imatrix";
 	if (forced === "q4" || forced === "q4-imatrix") return "q4";
-	if (forced) throw new Error(`Invalid DS4_MODEL_QUANT=${forced}; expected q2, q2-imatrix, q4 or q4-imatrix`);
+	if (forced) {
+		throw new Error(
+			`Invalid DS4_MODEL_QUANT=${forced}; expected q2, q2-imatrix, q2-q4-imatrix, q4 or q4-imatrix`,
+		);
+	}
 
 	const ramGb = totalmem() / 1_000_000_000;
 	if (ramGb >= 256) return "q4";
-	if (ramGb >= 128) return "q2-imatrix";
+	if (ramGb >= 128) return "q2-q4-imatrix";
+	if (ramGb >= 96) return "q2-imatrix";
 	throw new Error(
-		`DeepSeek V4 Flash requires at least 128 GB RAM for the q2-imatrix model; detected ${ramGb.toFixed(1)} GB`,
+		`DeepSeek V4 Flash requires at least 96 GB RAM for the q2-imatrix model; detected ${ramGb.toFixed(1)} GB`,
 	);
 }
 
@@ -349,23 +374,30 @@ function canonicalModelQuant(modelQuant: ModelQuant): ModelQuant {
 
 function modelQuantForModelId(modelId: string | undefined): ModelQuant | undefined {
 	if (modelId === Q2_IMATRIX_MODEL_ID) return "q2-imatrix";
+	if (modelId === Q2_Q4_IMATRIX_MODEL_ID) return "q2-q4-imatrix";
 	if (modelId === MODEL_ID) return selectedDefaultModelQuant();
 	return undefined;
 }
 
 function modelIdForQuant(modelQuant: ModelQuant): string {
 	modelQuant = canonicalModelQuant(modelQuant);
-	return modelQuant === "q2-imatrix" ? Q2_IMATRIX_MODEL_ID : MODEL_ID;
+	if (modelQuant === "q2-imatrix") return Q2_IMATRIX_MODEL_ID;
+	if (modelQuant === "q2-q4-imatrix") return Q2_Q4_IMATRIX_MODEL_ID;
+	return MODEL_ID;
 }
 
 function kvDirForQuant(modelQuant: ModelQuant): string {
 	modelQuant = canonicalModelQuant(modelQuant);
-	return modelQuant === "q2-imatrix" ? join(DS4_DIR, "kv-q2-imatrix") : KV_DIR;
+	if (modelQuant === "q2-imatrix") return join(DS4_DIR, "kv-q2-imatrix");
+	if (modelQuant === "q2-q4-imatrix") return join(DS4_DIR, "kv-q2-q4-imatrix");
+	return KV_DIR;
 }
 
 function downloadTargetsForQuant(modelQuant: ModelQuant): string[] {
 	modelQuant = canonicalModelQuant(modelQuant);
-	return modelQuant === "q4" ? ["q4-imatrix", "q4"] : ["q2-imatrix", "q2"];
+	if (modelQuant === "q4") return ["q4-imatrix", "q4"];
+	if (modelQuant === "q2-q4-imatrix") return ["q2-q4-imatrix"];
+	return ["q2-imatrix", "q2"];
 }
 
 function downloadScriptMentionsTarget(script: string, target: string): boolean {
@@ -406,15 +438,16 @@ function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: Mod
 	if (!state) return false;
 	modelQuant = canonicalModelQuant(modelQuant);
 	if (state.modelQuant) return canonicalModelQuant(state.modelQuant) === modelQuant;
-	// Older pi-ds4 installs did not record the quant. Treat them as matching the
-	// historical default model, but never as the explicit q2-imatrix choice.
-	return modelQuant !== "q2-imatrix";
+	// Older pi-ds4 installs did not record the quant and historically loaded q4.
+	// Do not mistake one for either of the newer explicit 2-bit choices.
+	return modelQuant === "q4";
 }
 
 async function ensureDirs(): Promise<void> {
 	await mkdir(CLIENT_DIR, { recursive: true });
 	await mkdir(KV_DIR, { recursive: true });
 	await mkdir(kvDirForQuant("q2-imatrix"), { recursive: true });
+	await mkdir(kvDirForQuant("q2-q4-imatrix"), { recursive: true });
 }
 
 async function readJson<T>(file: string): Promise<T | undefined> {
@@ -1096,13 +1129,45 @@ async function isDs4Checkout(dir: string): Promise<boolean> {
 	}
 }
 
+async function updateManagedSupportCheckout(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	if (!configBoolean("DS4_AUTO_UPDATE", true)) return;
+	if (!(await isDs4Checkout(runtimeDir))) return;
+
+	// A symlink is installed for local development and belongs to its developer;
+	// only update the checkout cloned and managed under ~/.pi/ds4/support.
+	if ((await lstat(SUPPORT_DIR).catch(() => undefined))?.isSymbolicLink()) return;
+	if (!(await stat(join(runtimeDir, ".git")).catch(() => undefined))?.isDirectory()) return;
+
+	const before = (await execCapture("git", ["-C", runtimeDir, "rev-parse", "HEAD"], 5_000))?.trim();
+	onStatus?.("checking for the latest ds4 runtime and model manifest");
+	try {
+		await runLogged(
+			"git",
+			["pull", "--ff-only", "origin", SUPPORT_BRANCH],
+			runtimeDir,
+			"update ds4 support checkout",
+			{ onStatus, progressPrefix: "updating ds4 support checkout" },
+		);
+	} catch (error) {
+		// Keep an already installed local runtime usable while offline. The failure
+		// remains visible in the log and the next session retries the update.
+		await appendLog(`[${new Date().toISOString()}] ds4 update skipped: ${describeError(error)}\n`);
+		return;
+	}
+	const after = (await execCapture("git", ["-C", runtimeDir, "rev-parse", "HEAD"], 5_000))?.trim();
+	runtimeCheckoutUpdated = !!before && !!after && before !== after;
+}
+
 async function ensureSupportCheckout(onStatus?: StatusCallback): Promise<string> {
 	if (await isDs4Checkout(SUPPORT_DIR)) {
+		let runtimeDir: string;
 		try {
-			return await realpath(SUPPORT_DIR);
+			runtimeDir = await realpath(SUPPORT_DIR);
 		} catch {
-			return SUPPORT_DIR;
+			runtimeDir = SUPPORT_DIR;
 		}
+		await updateManagedSupportCheckout(runtimeDir, onStatus);
+		return runtimeDir;
 	}
 
 	try {
@@ -1144,12 +1209,9 @@ async function resolveRuntimeDirLocked(onStatus?: StatusCallback): Promise<strin
 }
 
 async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
-	try {
-		await access(join(runtimeDir, "ds4-server"), constants.X_OK);
-		return;
-	} catch {}
-
-	onStatus?.("building ds4-server");
+	// Let make compare the binary with the current checkout. This is cheap when
+	// up to date and ensures a refreshed ds4 checkout never keeps an old server.
+	onStatus?.("ensuring latest ds4-server build");
 	await runLogged("make", ["ds4-server"], runtimeDir, "build ds4-server", {
 		onStatus,
 		progressPrefix: "building ds4-server",
@@ -1498,7 +1560,10 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 				stoppingPid = state!.pid;
 				return;
 			}
-			if (!serverStateMatchesEndpoint(state)) {
+			if (runtimeCheckoutUpdated) {
+				onStatus?.("restarting ds4-server after runtime update");
+				await stopServerPidLocked(state!.pid, "apply updated ds4 runtime/model manifest");
+			} else if (!serverStateMatchesEndpoint(state)) {
 				onStatus?.("moving ds4-server to reserved port");
 				await stopServerPidLocked(state!.pid, "move ds4-server to reserved port");
 			} else if (serverStateMatchesQuant(state, modelQuant)) {
@@ -1513,9 +1578,9 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 		if (await checkHttpReady()) {
 			const pid = await findListeningDs4ServerPid();
 			if (pid) {
-				if (modelQuant === "q2-imatrix") {
-					onStatus?.("switching ds4-server to q2-imatrix model");
-					await stopServerPidLocked(pid, "replace unknown ds4-server with q2-imatrix");
+				if (modelQuant !== "q4") {
+					onStatus?.(`switching ds4-server to ${modelQuant} model`);
+					await stopServerPidLocked(pid, `replace unknown ds4-server with ${modelQuant}`);
 				} else {
 					await writeAdoptedServerStateLocked(pid);
 					return;
@@ -1613,22 +1678,44 @@ function registerDs4Command(pi: ExtensionAPI): void {
 	});
 }
 
-function ds4Model(id: string, name: string) {
+function modelCompat(): ProviderModelConfig["compat"] {
+	if (PROVIDER_API === "openai-completions") {
+		return {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			supportsUsageInStreaming: true,
+			maxTokensField: "max_tokens",
+			supportsStrictMode: false,
+			thinkingFormat: "deepseek",
+			requiresReasoningContentOnAssistantMessages: true,
+		};
+	}
+	if (PROVIDER_API === "openai-responses") {
+		return { supportsDeveloperRole: false, supportsStrictMode: false };
+	}
+	return { supportsEagerToolInputStreaming: false };
+}
+
+function ds4Model(id: string, name: string): ProviderModelConfig {
 	return {
 		id,
 		name,
 		reasoning: true,
 		thinkingLevelMap: {
-			minimal: "low",
-			low: "low",
-			medium: "medium",
+			off: "none",
+			minimal: null,
+			low: null,
+			medium: null,
 			high: "high",
-			xhigh: "xhigh",
+			xhigh: null,
+			max: "max",
 		},
 		input: ["text"],
-		contextWindow: 100000,
-		maxTokens: 384000,
+		contextWindow: SERVER_CONTEXT_TOKENS,
+		maxTokens: Math.min(384_000, SERVER_CONTEXT_TOKENS),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		compat: modelCompat(),
 	};
 }
 
@@ -1638,22 +1725,12 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 		baseUrl: providerBaseUrl(),
 		api: PROVIDER_API,
 		apiKey: configString("DS4_API_KEY", "dsv4-local"),
-		compat: {
-			supportsStore: false,
-			supportsDeveloperRole: false,
-			supportsReasoningEffort: true,
-			supportsUsageInStreaming: true,
-			maxTokensField: "max_tokens",
-			supportsStrictMode: false,
-			thinkingFormat: "deepseek",
-			requiresReasoningContentOnAssistantMessages: true,
-			...(PROVIDER_API === "anthropic-messages" ? { supportsEagerToolInputStreaming: false } : {}),
-		},
 		models: [
-			ds4Model(MODEL_ID, "DeepSeek V4 Flash (ds4.c local)"),
+			ds4Model(MODEL_ID, "DeepSeek V4 Flash (ds4.c local, automatic quant)"),
 			ds4Model(Q2_IMATRIX_MODEL_ID, "DeepSeek V4 Flash q2 imatrix (ds4.c local)"),
+			ds4Model(Q2_Q4_IMATRIX_MODEL_ID, "DeepSeek V4 Flash mixed q2/q4 imatrix (ds4.c local)"),
 		],
-	} as any);
+	});
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -1666,6 +1743,7 @@ export default async function (pi: ExtensionAPI) {
 	startupModelQuant = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
+	runtimeCheckoutUpdated = false;
 	currentEndpoint = undefined;
 
 	await initializeEndpoint();
