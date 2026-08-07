@@ -7,6 +7,7 @@
   "runtimeDir": null,
   "autoUpdate": true,
   "contextTokens": 393216,
+  "power": 100,
   "readyTimeoutMs": 600000,
   "serverBinary": null,
   "watchdogScript": null

@@ -61,6 +61,11 @@ See [`settings.example.json`](settings.example.json) for all options. Each
 setting also has a `DS4_*` environment variable; environment variables take
 precedence. Restart Pi or run `/reload` after changing settings.
 
+Set `power` to an integer from 1 to 100 to limit the GPU duty cycle for
+DeepSeek models, reducing heat and fan noise. It defaults to 100. GLM 5.2
+currently always runs at full power because upstream does not support
+throttling it.
+
 Runtime files, downloaded models, caches, and logs are stored in `~/.pi/ds4`.
 Package-managed ds4 checkouts update automatically; explicitly configured or
 local development checkouts are left untouched.

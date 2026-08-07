@@ -137,6 +137,10 @@ const SERVER_CONTEXT_TOKENS = configNumber("DS4_CONTEXT_TOKENS", 393_216);
 if (!Number.isInteger(SERVER_CONTEXT_TOKENS) || SERVER_CONTEXT_TOKENS <= 0) {
 	throw new Error(`DS4_CONTEXT_TOKENS must be a positive integer in the environment or ${SETTINGS_FILE}`);
 }
+const SERVER_POWER = configNumber("DS4_POWER", 100);
+if (!Number.isInteger(SERVER_POWER) || SERVER_POWER < 1 || SERVER_POWER > 100) {
+	throw new Error(`DS4_POWER must be an integer between 1 and 100 in the environment or ${SETTINGS_FILE}`);
+}
 const SERVER_BASE_ARGS = ["--kv-disk-space-mb", "8192"];
 
 const HEARTBEAT_MS = 10_000;
@@ -535,6 +539,17 @@ async function discoverInstalledModelKeys(runtimeDir?: string): Promise<Set<Mode
 	return installed;
 }
 
+function powerPercentForModel(modelKey: ModelKey): number {
+	// Upstream ds4 currently rejects throttling for GLM 5.2. Keep those
+	// models at full speed while still honoring the setting for DeepSeek.
+	return modelKey.startsWith("glm52-") ? 100 : SERVER_POWER;
+}
+
+function powerArgsForModel(modelKey: ModelKey): string[] {
+	const power = powerPercentForModel(modelKey);
+	return power < 100 ? ["--power", String(power)] : [];
+}
+
 function serverArgsForModel(modelKey: ModelKey, modelPath: string, endpoint = currentServerEndpoint()): string[] {
 	return [
 		"--model",
@@ -546,6 +561,7 @@ function serverArgsForModel(modelKey: ModelKey, modelPath: string, endpoint = cu
 		"--ctx",
 		String(contextTokensForModel(modelKey)),
 		...SERVER_BASE_ARGS,
+		...powerArgsForModel(modelKey),
 		"--kv-disk-dir",
 		kvDirForModel(modelKey),
 	];
@@ -564,6 +580,17 @@ function legacyModelKey(state: ServerState): ModelKey | undefined {
 function serverStateMatchesModel(state: ServerState | undefined, modelKey: ModelKey): boolean {
 	if (!state) return false;
 	return (state.modelKey ?? modelKeyForModelId(state.modelId) ?? legacyModelKey(state)) === modelKey;
+}
+
+function serverStatePowerPercent(state: ServerState): number | undefined {
+	const powerIndex = state.args.lastIndexOf("--power");
+	if (powerIndex < 0) return 100;
+	const power = Number(state.args[powerIndex + 1]);
+	return Number.isInteger(power) && power >= 1 && power <= 100 ? power : undefined;
+}
+
+function serverStateMatchesPower(state: ServerState | undefined, modelKey: ModelKey): boolean {
+	return !!state && serverStatePowerPercent(state) === powerPercentForModel(modelKey);
 }
 
 async function ensureDirs(): Promise<void> {
@@ -1517,7 +1544,11 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
 async function checkHttpReadyForModel(modelKey: ModelKey): Promise<boolean> {
 	if (!(await checkHttpReady())) return false;
 	const state = await readState();
-	return serverStateMatchesEndpoint(state) && serverStateMatchesModel(state, modelKey);
+	return (
+		serverStateMatchesEndpoint(state) &&
+		serverStateMatchesModel(state, modelKey) &&
+		serverStateMatchesPower(state, modelKey)
+	);
 }
 
 async function stopServerPidLocked(pid: number, reason: string): Promise<void> {
@@ -1679,11 +1710,15 @@ async function ensureServerManagedInner(modelKey: ModelKey, onStatus?: StatusCal
 			} else if (!serverStateMatchesEndpoint(state)) {
 				onStatus?.("moving ds4-server to reserved port");
 				await stopServerPidLocked(state!.pid, "move ds4-server to reserved port");
-			} else if (serverStateMatchesModel(state, modelKey)) {
-				return;
-			} else {
+			} else if (!serverStateMatchesModel(state, modelKey)) {
 				onStatus?.(`switching ds4-server to ${modelKey}`);
 				await stopServerPidLocked(state!.pid, `switch ds4-server to ${modelKey}`);
+			} else if (!serverStateMatchesPower(state, modelKey)) {
+				const power = powerPercentForModel(modelKey);
+				onStatus?.(`restarting ds4-server at ${power}% power`);
+				await stopServerPidLocked(state!.pid, `apply configured ${power}% power`);
+			} else {
+				return;
 			}
 		}
 

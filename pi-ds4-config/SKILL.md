@@ -24,6 +24,7 @@ Common settings:
 
 - `protocol`: `openai`, `openai-responses` (default), or `anthropic`
 - `contextTokens`: ds4/Pi context ceiling (default `393216`; GLM models use their lower supported limit)
+- `power`: DeepSeek GPU duty-cycle target from `1` to `100` (default `100`). Lower values reduce heat and fan noise. GLM 5.2 currently always runs at `100` because upstream does not support throttling it.
 - `autoUpdate`: fast-forward the package-managed ds4 checkout before use (default `true`; local/external checkouts are untouched)
 - `readyTimeoutMs`: server startup timeout in ms
 - `runtimeDir`: existing antirez/ds4 checkout instead of `~/.pi/ds4/support`
