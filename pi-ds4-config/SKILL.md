@@ -31,4 +31,6 @@ Common settings:
 - `serverBinary` / `watchdogScript`: custom executable/script paths
 - `apiKey`: token Pi sends to the local provider (default `dsv4-local`)
 
-After editing, run `/reload` or restart Pi. No model is installed or registered automatically. Use `/ds4` to download an explicit DeepSeek V4 Flash, DeepSeek V4 Pro, or GLM 5.2 variant and to view the log or control the server. Completed downloads are registered automatically in Pi's model catalogue.
+`DS4_GGUF_DIR` is an environment-only upstream ds4 option for storing downloaded GGUF files outside the runtime checkout. It is not a `settings.json` key.
+
+After editing, run `/reload` or restart Pi. Models are never downloaded automatically. Use `/ds4` to download an explicit DeepSeek V4 Flash, DeepSeek V4 Pro, or GLM 5.2 variant and to view the log or control the server. Existing and completed downloads are discovered and registered automatically in Pi's model catalogue.
