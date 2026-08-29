@@ -25,6 +25,8 @@ Common settings:
 - `protocol`: `openai`, `openai-responses` (default), or `anthropic`
 - `contextTokens`: ds4/Pi context ceiling (default `393216`; GLM models use their lower supported limit)
 - `power`: DeepSeek GPU duty-cycle target from `1` to `100` (default `100`). Lower values reduce heat and fan noise. GLM 5.2 currently always runs at `100` because upstream does not support throttling it.
+- `ssdStreaming`: start a managed server with `--ssd-streaming` (default `false`); reloading restarts the server only when the flag changes
+- `remoteHost` / `remotePort`: connect to an existing server in client-only mode; either non-null value activates it, with defaults `127.0.0.1` and `8000`
 - `autoUpdate`: fast-forward the package-managed ds4 checkout before use (default `true`; local/external checkouts are untouched)
 - `readyTimeoutMs`: server startup timeout in ms
 - `runtimeDir`: existing antirez/ds4 checkout instead of `~/.pi/ds4/support`
@@ -33,5 +35,7 @@ Common settings:
 - `apiKey`: token Pi sends to the local provider (default `dsv4-local`)
 
 `DS4_GGUF_DIR` is an environment-only upstream ds4 option for storing downloaded GGUF files outside the runtime checkout. It is not a `settings.json` key.
+
+In client-only mode, the host must be non-empty and the port an integer from `1` through `65535`. IPv4, DNS, and IPv6 hosts are supported over plain HTTP. The extension discovers models from `/v1/models`, caches the last successful catalogue for temporary outages, and exposes metadata refresh through `/ds4`. It does not inspect or download models, create local state or leases, start a watchdog, or control the remote server. `protocol`, `apiKey`, and `readyTimeoutMs` still apply; local lifecycle settings are ignored.
 
 After editing, run `/reload` or restart Pi. Models are never downloaded automatically. Use `/ds4` to download an explicit DeepSeek V4 Flash, DeepSeek V4 Pro, or GLM 5.2 variant and to view the log or control the server. Existing and completed downloads are discovered and registered automatically in Pi's model catalogue.

@@ -108,6 +108,11 @@ function configBoolean(envName: string, defaultValue: boolean): boolean {
 	throw new Error(`${envName} must be a boolean in the environment or ${SETTINGS_FILE}`);
 }
 
+function hasSetting(envName: string): boolean {
+	const value = settingValue(envName);
+	return value !== undefined && value !== null;
+}
+
 function selectedProtocol(): ProviderProtocol {
 	const raw = configString("DS4_PROTOCOL", "openai-responses")?.toLowerCase();
 	switch (raw) {
@@ -128,19 +133,23 @@ function selectedProtocol(): ProviderProtocol {
 	}
 }
 
-const SUPPORT_REPO = configString("DS4_SUPPORT_REPO", "https://github.com/antirez/ds4")!;
-const SUPPORT_BRANCH = configString("DS4_SUPPORT_BRANCH", "main")!;
+const CLIENT_ONLY = hasSetting("DS4_REMOTE_HOST") || hasSetting("DS4_REMOTE_PORT");
+const SUPPORT_REPO = CLIENT_ONLY
+	? "https://github.com/antirez/ds4"
+	: configString("DS4_SUPPORT_REPO", "https://github.com/antirez/ds4")!;
+const SUPPORT_BRANCH = CLIENT_ONLY ? "main" : configString("DS4_SUPPORT_BRANCH", "main")!;
 
 const SERVER_HOST = "127.0.0.1";
 const PROVIDER_API = selectedProtocol();
-const SERVER_CONTEXT_TOKENS = configNumber("DS4_CONTEXT_TOKENS", 393_216);
+const SERVER_CONTEXT_TOKENS = CLIENT_ONLY ? 393_216 : configNumber("DS4_CONTEXT_TOKENS", 393_216);
 if (!Number.isInteger(SERVER_CONTEXT_TOKENS) || SERVER_CONTEXT_TOKENS <= 0) {
 	throw new Error(`DS4_CONTEXT_TOKENS must be a positive integer in the environment or ${SETTINGS_FILE}`);
 }
-const SERVER_POWER = configNumber("DS4_POWER", 100);
+const SERVER_POWER = CLIENT_ONLY ? 100 : configNumber("DS4_POWER", 100);
 if (!Number.isInteger(SERVER_POWER) || SERVER_POWER < 1 || SERVER_POWER > 100) {
 	throw new Error(`DS4_POWER must be an integer between 1 and 100 in the environment or ${SETTINGS_FILE}`);
 }
+const SERVER_SSD_STREAMING = CLIENT_ONLY ? false : configBoolean("DS4_SSD_STREAMING", false);
 const SERVER_BASE_ARGS = ["--kv-disk-space-mb", "8192"];
 
 const HEARTBEAT_MS = 10_000;
@@ -259,6 +268,15 @@ type ServerEndpoint = {
 	apiBaseUrl: string;
 };
 
+type RemoteModelMetadata = {
+	id: string;
+	name: string;
+	contextLength: number;
+	maxTokens: number;
+};
+
+type RemoteConnectivity = "pending" | "waiting" | "connected" | "unavailable";
+
 type ServerState = {
 	managedBy: string;
 	pid: number;
@@ -317,14 +335,21 @@ type LogTheme = { fg: (color: "accent" | "border" | "dim", text: string) => stri
 type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
 
 const WATCHDOG_SCRIPT_NAME = "ds4-watchdog.sh";
-const WATCHDOG_SCRIPT_CONFIG = configString("DS4_WATCHDOG_SCRIPT");
+const WATCHDOG_SCRIPT_CONFIG = CLIENT_ONLY ? undefined : configString("DS4_WATCHDOG_SCRIPT");
 const WATCHDOG_SCRIPT = WATCHDOG_SCRIPT_CONFIG
 	? resolve(WATCHDOG_SCRIPT_CONFIG)
 	: join(EXTENSION_DIR, WATCHDOG_SCRIPT_NAME);
 
+const remoteModelCache = new Map<string, Model<ProviderProtocol>[]>();
+
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let startupPromise: Promise<void> | undefined;
 let startupModelKey: ModelKey | undefined;
+let remoteReadyPromise: Promise<void> | undefined;
+let remoteReadyController: AbortController | undefined;
+let remoteModels: Model<ProviderProtocol>[] = [];
+let remoteConnectivity: RemoteConnectivity = "pending";
+let remoteConnectivityError: string | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
 let runtimeCheckoutUpdated = false;
@@ -371,6 +396,32 @@ function endpointForPort(port: number, host = SERVER_HOST): ServerEndpoint {
 	if (!isValidPort(port)) throw new Error(`Invalid ds4-server port: ${port}`);
 	const origin = `http://${hostForUrl(host)}:${port}`;
 	return { host, port, origin, apiBaseUrl: `${origin}/v1` };
+}
+
+function configuredRemoteEndpoint(): ServerEndpoint {
+	const hostSetting = settingValue("DS4_REMOTE_HOST");
+	if (hostSetting !== undefined && hostSetting !== null && typeof hostSetting !== "string") {
+		throw new Error(`DS4_REMOTE_HOST must be a string in the environment or ${SETTINGS_FILE}`);
+	}
+	const host = configString("DS4_REMOTE_HOST", SERVER_HOST)!;
+	if (!host.trim() || host !== host.trim()) {
+		throw new Error(`DS4_REMOTE_HOST must be a non-empty host in the environment or ${SETTINGS_FILE}`);
+	}
+	if (settingValue("DS4_REMOTE_PORT") === "") {
+		throw new Error(`DS4_REMOTE_PORT must be an integer between 1 and 65535 in the environment or ${SETTINGS_FILE}`);
+	}
+	const port = configNumber("DS4_REMOTE_PORT", 8000);
+	if (!isValidPort(port)) {
+		throw new Error(`DS4_REMOTE_PORT must be an integer between 1 and 65535 in the environment or ${SETTINGS_FILE}`);
+	}
+	const endpoint = endpointForPort(port, host);
+	try {
+		const url = new URL(endpoint.origin);
+		if (url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error();
+	} catch {
+		throw new Error(`DS4_REMOTE_HOST=${host} is not a valid HTTP host`);
+	}
+	return endpoint;
 }
 
 function endpointFromUrl(value: string | undefined): ServerEndpoint | undefined {
@@ -562,6 +613,7 @@ function serverArgsForModel(modelKey: ModelKey, modelPath: string, endpoint = cu
 		String(contextTokensForModel(modelKey)),
 		...SERVER_BASE_ARGS,
 		...powerArgsForModel(modelKey),
+		...(SERVER_SSD_STREAMING ? ["--ssd-streaming"] : []),
 		"--kv-disk-dir",
 		kvDirForModel(modelKey),
 	];
@@ -591,6 +643,10 @@ function serverStatePowerPercent(state: ServerState): number | undefined {
 
 function serverStateMatchesPower(state: ServerState | undefined, modelKey: ModelKey): boolean {
 	return !!state && serverStatePowerPercent(state) === powerPercentForModel(modelKey);
+}
+
+function serverStateMatchesSsdStreaming(state: ServerState | undefined): boolean {
+	return !!state && state.args.includes("--ssd-streaming") === SERVER_SSD_STREAMING;
 }
 
 async function ensureDirs(): Promise<void> {
@@ -959,6 +1015,10 @@ async function resolveEndpointLocked(): Promise<ServerEndpoint> {
 }
 
 async function initializeEndpoint(): Promise<void> {
+	if (CLIENT_ONLY) {
+		currentEndpoint = configuredRemoteEndpoint();
+		return;
+	}
 	await withPortLock(async () => {
 		await resolveEndpointLocked();
 	}, LOCK_TIMEOUT_MS);
@@ -1519,6 +1579,74 @@ async function clearState(): Promise<void> {
 	await removeFile(STATE_FILE);
 }
 
+function parseRemoteModelMetadata(value: unknown): RemoteModelMetadata[] {
+	if (!value || typeof value !== "object" || !Array.isArray((value as { data?: unknown }).data)) {
+		throw new Error("Remote ds4 /v1/models response must contain a data array");
+	}
+	return (value as { data: unknown[] }).data.map((entry, index) => {
+		if (!entry || typeof entry !== "object") throw new Error(`Remote ds4 model at index ${index} must be an object`);
+		const model = entry as Record<string, unknown>;
+		const provider = model.top_provider;
+		if (typeof model.id !== "string" || !model.id.trim()) {
+			throw new Error(`Remote ds4 model at index ${index} has an invalid id`);
+		}
+		if (typeof model.name !== "string" || !model.name.trim()) {
+			throw new Error(`Remote ds4 model ${model.id} has an invalid name`);
+		}
+		if (!Number.isInteger(model.context_length) || (model.context_length as number) <= 0) {
+			throw new Error(`Remote ds4 model ${model.id} has an invalid context_length`);
+		}
+		if (
+			!provider ||
+			typeof provider !== "object" ||
+			!Number.isInteger((provider as Record<string, unknown>).max_completion_tokens) ||
+			((provider as Record<string, unknown>).max_completion_tokens as number) <= 0
+		) {
+			throw new Error(`Remote ds4 model ${model.id} has an invalid top_provider.max_completion_tokens`);
+		}
+		return {
+			id: model.id,
+			name: model.name,
+			contextLength: model.context_length as number,
+			maxTokens: (provider as Record<string, unknown>).max_completion_tokens as number,
+		};
+	});
+}
+
+async function fetchRemoteModelMetadata(signal?: AbortSignal): Promise<RemoteModelMetadata[]> {
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+	const timeout = setTimeout(() => controller.abort(), HTTP_CHECK_TIMEOUT_MS);
+	try {
+		const response = await fetch(`${apiBaseUrl()}/models`, { signal: controller.signal });
+		if (!response.ok) throw new Error(`Remote ds4 model discovery failed with HTTP ${response.status}`);
+		return parseRemoteModelMetadata(await response.json());
+	} finally {
+		clearTimeout(timeout);
+		signal?.removeEventListener("abort", abort);
+	}
+}
+
+async function refreshRemoteModels(signal?: AbortSignal): Promise<boolean> {
+	const origin = currentServerEndpoint().origin;
+	try {
+		const discovered = (await fetchRemoteModelMetadata(signal)).map(remoteDs4Model);
+		if (signal?.aborted) return false;
+		remoteModels = discovered;
+		remoteModelCache.set(origin, discovered);
+		remoteConnectivity = "connected";
+		remoteConnectivityError = undefined;
+		return true;
+	} catch (error) {
+		remoteModels = remoteModelCache.get(origin) ?? [];
+		remoteConnectivity = "unavailable";
+		remoteConnectivityError = describeError(error);
+		return false;
+	}
+}
+
 async function checkHttpReady(): Promise<boolean> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), HTTP_CHECK_TIMEOUT_MS);
@@ -1547,7 +1675,8 @@ async function checkHttpReadyForModel(modelKey: ModelKey): Promise<boolean> {
 	return (
 		serverStateMatchesEndpoint(state) &&
 		serverStateMatchesModel(state, modelKey) &&
-		serverStateMatchesPower(state, modelKey)
+		serverStateMatchesPower(state, modelKey) &&
+		serverStateMatchesSsdStreaming(state)
 	);
 }
 
@@ -1620,6 +1749,36 @@ async function waitForServerReady(modelKey: ModelKey, onStatus?: StatusCallback)
 	}
 
 	throw new Error(`Timed out waiting for ds4-server at ${apiBaseUrl()}; see ${LOG_FILE}`);
+}
+
+async function waitForRemoteServerReady(signal: AbortSignal, onStatus?: StatusCallback): Promise<void> {
+	const started = Date.now();
+	while (Date.now() - started < READY_TIMEOUT_MS) {
+		if (signal.aborted || runtimeDisposed || shuttingDown) throw new Error("Remote ds4 readiness wait cancelled");
+		if (await checkHttpReady()) {
+			remoteConnectivity = "connected";
+			remoteConnectivityError = undefined;
+			return;
+		}
+		remoteConnectivity = "waiting";
+		onStatus?.(`waiting for ds4-server at ${baseUrl()}`);
+		await sleep(1_000);
+	}
+	remoteConnectivity = "unavailable";
+	remoteConnectivityError = `Timed out waiting for ds4-server at ${baseUrl()}`;
+	throw new Error(remoteConnectivityError);
+}
+
+function ensureRemoteServerReady(onStatus?: StatusCallback): { promise: Promise<void>; owner: boolean } {
+	if (remoteReadyPromise) return { promise: remoteReadyPromise, owner: false };
+	const controller = new AbortController();
+	remoteReadyController = controller;
+	const promise = waitForRemoteServerReady(controller.signal, onStatus).finally(() => {
+		if (remoteReadyPromise === promise) remoteReadyPromise = undefined;
+		if (remoteReadyController === controller) remoteReadyController = undefined;
+	});
+	remoteReadyPromise = promise;
+	return { promise, owner: true };
 }
 
 async function startServerLocked(runtimeDir: string, modelKey: ModelKey, modelPath: string): Promise<void> {
@@ -1717,6 +1876,10 @@ async function ensureServerManagedInner(modelKey: ModelKey, onStatus?: StatusCal
 				const power = powerPercentForModel(modelKey);
 				onStatus?.(`restarting ds4-server at ${power}% power`);
 				await stopServerPidLocked(state!.pid, `apply configured ${power}% power`);
+		} else if (!serverStateMatchesSsdStreaming(state)) {
+			const mode = SERVER_SSD_STREAMING ? "enable" : "disable";
+			onStatus?.(`restarting ds4-server to ${mode} SSD streaming`);
+			await stopServerPidLocked(state!.pid, `${mode} configured SSD streaming`);
 			} else {
 				return;
 			}
@@ -1836,11 +1999,41 @@ async function showDs4Log(ctx: ExtensionCommandContext): Promise<void> {
 	}
 }
 
+async function handleRemoteDs4Command(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	const isReady = await checkHttpReady();
+	remoteConnectivity = isReady ? "connected" : "unavailable";
+	if (isReady) remoteConnectivityError = undefined;
+	const models = remoteModels.length
+		? remoteModels.map((model) => `${model.id} (${model.contextWindow} context)`).join(", ")
+		: "model discovery pending";
+	const details = [
+		`Endpoint: ${baseUrl()}`,
+		`Status: ${remoteConnectivity}${remoteConnectivityError ? ` — ${remoteConnectivityError}` : ""}`,
+		`Models: ${models}`,
+	].join("\n");
+	const action = await ctx.ui.select(`ds4 remote\n${details}`, ["Refresh remote models"]);
+	if (action !== "Refresh remote models") return;
+
+	ctx.ui.setStatus("ds4", `refreshing models from ${baseUrl()}`);
+	try {
+		const refreshed = await refreshRemoteModels();
+		registerDs4Provider(pi);
+		if (refreshed) ctx.ui.notify(`Discovered ${remoteModels.length} model(s) from ${baseUrl()}`, "info");
+		else ctx.ui.notify(`Remote model discovery pending: ${remoteConnectivityError}`, "error");
+	} finally {
+		ctx.ui.setStatus("ds4", undefined);
+	}
+}
+
 function registerDs4Command(pi: ExtensionAPI): void {
 	pi.registerCommand("ds4", {
-		description: "Manage the local ds4 server and models",
+		description: CLIENT_ONLY ? "Inspect the remote ds4 server and refresh models" : "Manage the local ds4 server and models",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
+			if (CLIENT_ONLY) {
+				await handleRemoteDs4Command(pi, ctx);
+				return;
+			}
 
 			const running = await isServerRunning();
 			const serverAction = running ? "Stop server" : "Start server";
@@ -1942,11 +2135,15 @@ function modelCompat(): Model<ProviderProtocol>["compat"] {
 	return { supportsEagerToolInputStreaming: false };
 }
 
-function ds4Model(model: DownloadableModel): Model<ProviderProtocol> {
-	const contextWindow = contextTokensForModel(model.key);
+function providerModel(
+	id: string,
+	name: string,
+	contextWindow: number,
+	maxTokens: number,
+): Model<ProviderProtocol> {
 	return {
-		id: model.key,
-		name: model.name,
+		id,
+		name,
 		api: PROVIDER_API,
 		provider: PROVIDER_ID,
 		baseUrl: providerBaseUrl(),
@@ -1962,14 +2159,27 @@ function ds4Model(model: DownloadableModel): Model<ProviderProtocol> {
 		},
 		input: ["text"],
 		contextWindow,
-		maxTokens: Math.min(model.maxTokens ?? 384_000, contextWindow),
+		maxTokens: Math.min(maxTokens, contextWindow),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		compat: modelCompat(),
 	};
 }
 
+function ds4Model(model: DownloadableModel): Model<ProviderProtocol> {
+	const contextWindow = contextTokensForModel(model.key);
+	return providerModel(model.key, model.name, contextWindow, model.maxTokens ?? 384_000);
+}
+
+function remoteDs4Model(model: RemoteModelMetadata): Model<ProviderProtocol> {
+	return providerModel(model.id, model.name, model.contextLength, model.maxTokens);
+}
+
 function registeredDs4Models(): Model<ProviderProtocol>[] {
 	return DOWNLOADABLE_MODELS.filter((model) => installedModelKeys.has(model.key)).map(ds4Model);
+}
+
+function registeredRemoteModels(): Model<ProviderProtocol>[] {
+	return remoteModels;
 }
 
 function protocolStreams(): ProviderStreams {
@@ -2010,33 +2220,73 @@ function managedStreams(upstream: ProviderStreams): ProviderStreams {
 	};
 }
 
+function remoteStreams(upstream: ProviderStreams): ProviderStreams {
+	const prepare = (
+		model: Model<any>,
+		run: () => ReturnType<ProviderStreams["stream"]>,
+	) =>
+		lazyStream(model, async () => {
+			if (await checkHttpReady()) {
+				remoteConnectivity = "connected";
+				remoteConnectivityError = undefined;
+				return run();
+			}
+
+			const { promise, owner } = ensureRemoteServerReady(ownerStatusCallback());
+			try {
+				await promise;
+				if (owner) providerStatusCallback?.(`connected to ds4-server at ${baseUrl()}`);
+				return run();
+			} catch (error) {
+				remoteConnectivity = "unavailable";
+				remoteConnectivityError = describeError(error);
+				if (owner) providerStatusCallback?.(`cannot reach ds4-server at ${baseUrl()}`);
+				throw error;
+			} finally {
+				if (owner) providerStatusCallback?.(undefined);
+			}
+		});
+
+	function ownerStatusCallback(): StatusCallback | undefined {
+		return remoteReadyPromise ? undefined : providerStatusCallback;
+	}
+
+	return {
+		stream: (model, context, options) => prepare(model, () => upstream.stream(model, context, options)),
+		streamSimple: (model, context, options) => prepare(model, () => upstream.streamSimple(model, context, options)),
+	};
+}
+
 function createDs4Provider(): Provider<ProviderProtocol> {
 	const configuredApiKey = configString("DS4_API_KEY", "dsv4-local");
+	const models = CLIENT_ONLY ? registeredRemoteModels() : registeredDs4Models();
 	const provider = createProvider<ProviderProtocol>({
 		id: PROVIDER_ID,
-		name: "ds4.c local",
+		name: `ds4.c ${CLIENT_ONLY ? "remote" : "local"}`,
 		baseUrl: providerBaseUrl(),
 		auth: {
 			apiKey: {
-				name: "Local ds4 server",
+				name: `${CLIENT_ONLY ? "Remote" : "Local"} ds4 server`,
 				async resolve({ credential }) {
 					return {
 						auth: { apiKey: credential?.key ?? configuredApiKey },
-						source: "local ds4-server",
+						source: `${CLIENT_ONLY ? "remote" : "local"} ds4-server`,
 					};
 				},
 			},
 		},
-		models: registeredDs4Models(),
-		api: managedStreams(protocolStreams()),
+		models,
+		api: CLIENT_ONLY ? remoteStreams(protocolStreams()) : managedStreams(protocolStreams()),
 	});
 
-	// Local files are the catalog of record. Avoid createProvider's fetchModels
-	// store so a removed GGUF cannot be resurrected from a persisted model list.
 	return {
 		...provider,
-		getModels: registeredDs4Models,
+		getModels: CLIENT_ONLY ? registeredRemoteModels : registeredDs4Models,
 		async refreshModels({ signal }) {
+			if (CLIENT_ONLY) {
+				await refreshRemoteModels(signal);
+				return;
+			}
 			const discovered = await discoverInstalledModelKeys();
 			if (!signal?.aborted) installedModelKeys = discovered;
 		},
@@ -2048,7 +2298,8 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 }
 
 async function refreshDs4Provider(pi: ExtensionAPI): Promise<void> {
-	installedModelKeys = await discoverInstalledModelKeys(resolvedRuntimeDir);
+	if (CLIENT_ONLY) await refreshRemoteModels();
+	else installedModelKeys = await discoverInstalledModelKeys(resolvedRuntimeDir);
 	registerDs4Provider(pi);
 }
 
@@ -2060,14 +2311,27 @@ export default async function (pi: ExtensionAPI) {
 	watchdogStarted = false;
 	startupPromise = undefined;
 	startupModelKey = undefined;
+	remoteReadyController?.abort();
+	remoteReadyPromise = undefined;
+	remoteReadyController = undefined;
+	remoteConnectivity = "pending";
+	remoteConnectivityError = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
 	runtimeCheckoutUpdated = false;
 	providerStatusCallback = undefined;
-	installedModelKeys = await discoverInstalledModelKeys();
 	currentEndpoint = undefined;
 
-	await initializeEndpoint();
+	if (CLIENT_ONLY) {
+		await initializeEndpoint();
+		installedModelKeys = new Set<ModelKey>();
+		remoteModels = remoteModelCache.get(currentServerEndpoint().origin) ?? [];
+		await refreshRemoteModels();
+	} else {
+		remoteModels = [];
+		installedModelKeys = await discoverInstalledModelKeys();
+		await initializeEndpoint();
+	}
 	registerDs4Provider(pi);
 	registerDs4Command(pi);
 
@@ -2084,9 +2348,15 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event, ctx) => {
 		runtimeDisposed = true;
 		providerStatusCallback = undefined;
+		if (CLIENT_ONLY) {
+			remoteReadyController?.abort();
+			remoteReadyController = undefined;
+			remoteReadyPromise = undefined;
+			return;
+		}
+
 		stopHeartbeat();
 		killActiveSetupChild();
-
 		try {
 			if (startupPromise) await Promise.race([startupPromise.catch(() => {}), sleep(5_000)]);
 		} catch {}

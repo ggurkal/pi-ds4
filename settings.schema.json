@@ -46,6 +46,21 @@
     "DS4_POWER": { "$ref": "#/$defs/powerPercent" },
     "ds4_power": { "$ref": "#/$defs/powerPercent" },
 
+    "ssdStreaming": { "$ref": "#/$defs/nullableBoolean" },
+    "ssd_streaming": { "$ref": "#/$defs/nullableBoolean" },
+    "DS4_SSD_STREAMING": { "$ref": "#/$defs/nullableBoolean" },
+    "ds4_ssd_streaming": { "$ref": "#/$defs/nullableBoolean" },
+
+    "remoteHost": { "$ref": "#/$defs/remoteHost" },
+    "remote_host": { "$ref": "#/$defs/remoteHost" },
+    "DS4_REMOTE_HOST": { "$ref": "#/$defs/remoteHost" },
+    "ds4_remote_host": { "$ref": "#/$defs/remoteHost" },
+
+    "remotePort": { "$ref": "#/$defs/remotePort" },
+    "remote_port": { "$ref": "#/$defs/remotePort" },
+    "DS4_REMOTE_PORT": { "$ref": "#/$defs/remotePort" },
+    "ds4_remote_port": { "$ref": "#/$defs/remotePort" },
+
     "readyTimeoutMs": { "$ref": "#/$defs/nullableNumber" },
     "ready_timeout_ms": { "$ref": "#/$defs/nullableNumber" },
     "DS4_READY_TIMEOUT_MS": { "$ref": "#/$defs/nullableNumber" },
@@ -80,6 +95,17 @@
       "pattern": "^(?:[1-9]|[1-9][0-9]|100)$",
       "default": 100,
       "description": "GPU duty-cycle target from 1 to 100. Lower values apply to DeepSeek models; GLM 5.2 currently always runs at 100."
+    },
+    "remoteHost": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "Client-only ds4 server host. Either remote setting activates client-only mode."
+    },
+    "remotePort": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "Client-only ds4 server TCP port. Either remote setting activates client-only mode."
     },
     "protocol": {
       "type": ["string", "null"],

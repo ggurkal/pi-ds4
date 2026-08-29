@@ -66,6 +66,41 @@ DeepSeek models, reducing heat and fan noise. It defaults to 100. GLM 5.2
 currently always runs at full power because upstream does not support
 throttling it.
 
+Set `ssdStreaming` to `true` to start the managed server with
+`--ssd-streaming`. Changing the setting and reloading Pi restarts a running
+server only when the flag needs to be added or removed. It defaults to `false`.
+
+### Client-only mode
+
+Set `remoteHost`, `remotePort`, or both to use an already-running ds4 server
+without managing anything locally:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
+  "remoteHost": "10.0.0.5",
+  "remotePort": 8000
+}
+```
+
+Either non-null setting activates client-only mode. The missing value defaults
+to `127.0.0.1` or port `8000`. Hosts must be non-empty, ports must be integers
+from 1 through 65535, IPv4, DNS names, and IPv6 addresses are supported, and
+the connection intentionally uses plain HTTP.
+
+The extension discovers the remote server's models from `/v1/models` and uses
+the returned names and token limits. It keeps the last successful catalogue for
+the configured origin during temporary outages; cached models remain selectable
+but do not make an unavailable server ready. Use `/ds4` to inspect connectivity
+and refresh model metadata.
+
+Client-only mode never checks out a runtime, inspects or downloads local model
+files, reserves a port, creates leases, starts a watchdog, or starts, restarts,
+or stops a server. `protocol`, `apiKey`, and `readyTimeoutMs` still apply.
+Managed-only settings such as `autoUpdate`, `contextTokens`, `power`,
+`ssdStreaming`, `runtimeDir`, `serverBinary`, `supportRepo`, `supportBranch`, and
+`watchdogScript` are ignored.
+
 Runtime files, downloaded models, caches, and logs are stored in `~/.pi/ds4`.
 Package-managed ds4 checkouts update automatically; explicitly configured or
 local development checkouts are left untouched.

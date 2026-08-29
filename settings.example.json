@@ -8,6 +8,9 @@
   "autoUpdate": true,
   "contextTokens": 393216,
   "power": 100,
+  "ssdStreaming": false,
+  "remoteHost": null,
+  "remotePort": null,
   "readyTimeoutMs": 600000,
   "serverBinary": null,
   "watchdogScript": null
